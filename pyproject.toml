@@ -1,0 +1,18 @@
+[project]
+name = "comfyui-openpose-editor-dockr"
+description = "An enhanced OpenPose Editor for ComfyUI with pose auto-completion, pause/edit workflow support, and UI fixes."
+version = "1.0.0"
+license = { text = "MIT" }
+dependencies = [
+    "numpy<2",
+    "opencv-python==4.10.0.84",
+    "Pillow"
+]
+
+[project.urls]
+Repository = "https://github.com/DocWorkBox/ComfyUI-OpenPose-Editor-DocKr"
+
+[tool.comfy]
+PublisherId = "zhaoke1006"
+DisplayName = "whk OpenPose Editor_DocKr"
+Icon = "https://github.com/DocWorkBox/ComfyUI-OpenPose-Editor-DocKr/blob/master/assets/pause_mode.png?raw=true"
