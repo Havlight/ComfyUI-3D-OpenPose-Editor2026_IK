@@ -3,6 +3,92 @@ import { api } from "../../scripts/api.js";
 import { ComfyWidgets } from "../../scripts/widgets.js";
 import "./fabric.min.js";
 
+const OPENPOSE_EDITOR_EXTENSION_NAME = "DocKr.OpenPoseEditor3D";
+const OPENPOSE_EDITOR_NODE_NAME = "Nui.OpenPoseEditor";
+const OPENPOSE_EDITOR_BOOTSTRAP_KEY = "__COMFYUI_3D_OPENPOSE_EDITOR2026_BOOTSTRAPPED__";
+const OPENPOSE_EDITOR_THREE_LOADER_KEY = "__COMFYUI_3D_OPENPOSE_EDITOR2026_THREE_LOADER__";
+
+function resolveThreeModule(mod) {
+    if (mod?.default?.WebGLRenderer) {
+        return mod.default;
+    }
+    if (mod?.THREE?.WebGLRenderer) {
+        return mod.THREE;
+    }
+    if (mod?.WebGLRenderer) {
+        return mod;
+    }
+    return null;
+}
+
+async function loadSharedThreeModule(url) {
+    const mod = await import(/* @vite-ignore */ url);
+    const THREE = resolveThreeModule(mod) || globalThis.THREE;
+    if (!THREE?.WebGLRenderer) {
+        throw new Error(`Three.js module did not expose WebGLRenderer: ${url}`);
+    }
+    globalThis.THREE = THREE;
+    return THREE;
+}
+
+async function loadBundledThreeFallback() {
+    const fallbackUrl = new URL("./vendor/three.min.txt", import.meta.url);
+    const response = await fetch(fallbackUrl);
+    if (!response.ok) {
+        throw new Error(`Failed to fetch bundled Three.js fallback: ${response.status}`);
+    }
+
+    const source = await response.text();
+    const blobUrl = URL.createObjectURL(new Blob([source], { type: "text/javascript" }));
+    try {
+        await import(/* @vite-ignore */ blobUrl);
+    } finally {
+        URL.revokeObjectURL(blobUrl);
+    }
+
+    if (!globalThis.THREE?.WebGLRenderer) {
+        throw new Error("Bundled Three.js fallback did not initialize window.THREE");
+    }
+
+    return globalThis.THREE;
+}
+
+async function ensureThreeJsLoaded() {
+    if (globalThis.THREE?.WebGLRenderer) {
+        return globalThis.THREE;
+    }
+
+    if (globalThis[OPENPOSE_EDITOR_THREE_LOADER_KEY]) {
+        return await globalThis[OPENPOSE_EDITOR_THREE_LOADER_KEY];
+    }
+
+    globalThis[OPENPOSE_EDITOR_THREE_LOADER_KEY] = (async () => {
+        const sharedModuleCandidates = [
+            new URL("../vnccs-utils/three.module.js", import.meta.url).href,
+            new URL("../vnccs-utils/web/three.module.js", import.meta.url).href,
+            "/extensions/vnccs-utils/three.module.js",
+            "/extensions/vnccs-utils/web/three.module.js",
+        ];
+
+        for (const candidate of sharedModuleCandidates) {
+            try {
+                return await loadSharedThreeModule(candidate);
+            } catch (error) {
+                console.debug(`[OpenPose3D] Shared Three.js candidate failed: ${candidate}`, error);
+            }
+        }
+
+        return await loadBundledThreeFallback();
+    })();
+
+    try {
+        return await globalThis[OPENPOSE_EDITOR_THREE_LOADER_KEY];
+    } catch (error) {
+        delete globalThis[OPENPOSE_EDITOR_THREE_LOADER_KEY];
+        throw error;
+    }
+}
+
 function dataURLToBlob(dataurl) {
     var arr = dataurl.split(','), mime = arr[0].match(/:(.*?);/)[1],
         bstr = atob(arr[1]), n = bstr.length, u8arr = new Uint8Array(n);
@@ -115,6 +201,8 @@ class OpenPosePanel {
     node = null;
     canvas = null;
     canvasElem = null;
+    canvasWrapperEl = null;
+    canvasHostElem = null;
     panel = null;
 
     undo_history = [];
@@ -1180,6 +1268,11 @@ class OpenPosePanel {
 
         this.canvas = this.initCanvas(this.canvasElem);
         this.canvas.wrapperEl.style.pointerEvents = 'auto';
+        this.canvasWrapperEl = this.canvas.wrapperEl || this.canvasElem.parentElement;
+        this.canvasHostElem = this.canvasWrapperEl?.parentElement || container;
+        if (this.canvasHostElem && !this.canvasHostElem.style.position) {
+            this.canvasHostElem.style.position = "relative";
+        }
 
 
         container.addEventListener('contextmenu', function(e) {
@@ -1704,6 +1797,35 @@ class OpenPosePanel {
                 this.canvas.upperCanvasEl.style.width = "100%";
                 this.canvas.upperCanvasEl.style.height = "100%";
             }
+        }
+
+        if (this.threeContainer && this.threeRenderer) {
+            const threeRect = this.threeContainer.getBoundingClientRect();
+            if (threeRect.width > 0 && threeRect.height > 0) {
+                this.threeRenderer.setSize(threeRect.width, threeRect.height);
+                if (this.threeCamera) {
+                    this.threeCamera.aspect = threeRect.width / threeRect.height;
+                    this.threeCamera.updateProjectionMatrix();
+                }
+            }
+        }
+    }
+
+    set2DCanvasInteractive(isInteractive) {
+        const wrapperEl = this.canvasWrapperEl || this.canvas?.wrapperEl || this.canvasElem?.parentElement;
+        if (wrapperEl) {
+            wrapperEl.style.visibility = isInteractive ? "visible" : "hidden";
+            wrapperEl.style.pointerEvents = isInteractive ? "auto" : "none";
+        } else if (this.canvasElem) {
+            this.canvasElem.style.visibility = isInteractive ? "visible" : "hidden";
+            this.canvasElem.style.pointerEvents = isInteractive ? "auto" : "none";
+        }
+
+        if (this.canvas?.upperCanvasEl) {
+            this.canvas.upperCanvasEl.style.pointerEvents = isInteractive ? "auto" : "none";
+        }
+        if (this.canvasElem) {
+            this.canvasElem.style.pointerEvents = isInteractive ? "auto" : "none";
         }
     }
 
@@ -2808,7 +2930,7 @@ class OpenPosePanel {
         }
 
         if (this.is3DMode) {
-            this.enter3DMode();
+            void this.enter3DMode();
         } else {
             this.exit3DMode();
 
@@ -2848,22 +2970,36 @@ class OpenPosePanel {
         if (this.mode3DButton) {
             this.mode3DButton.textContent = "3D模式: 开";
         }
-        this.enter3DMode();
+        void this.enter3DMode();
     }
 
 
-    enter3DMode() {
-
-        if (this.canvasElem) {
-            this.canvasElem.style.display = 'none';
+    async enter3DMode() {
+        try {
+            await ensureThreeJsLoaded();
+        } catch (error) {
+            console.error("[OpenPose3D] Failed to load Three.js", error);
+            this.is3DMode = false;
+            if (this.mode3DButton) {
+                this.mode3DButton.textContent = "3D模式: 关";
+            }
+            alert("必要3D资源载入失败。请重新整理页面后再试。");
+            return;
         }
 
+        if (!this.is3DMode) {
+            return;
+        }
+
+        const THREE = globalThis.THREE;
+        this.set2DCanvasInteractive(false);
 
         if (!this.threeContainer) {
             this.threeContainer = document.createElement('div');
-
-            this.threeContainer.style.cssText = 'position: absolute; inset: 0; z-index: 1; pointer-events: auto; overflow: hidden;';
-            this.canvasElem.parentNode.appendChild(this.threeContainer);
+            this.threeContainer.style.cssText = 'position: absolute; inset: 0; z-index: 5; pointer-events: auto; overflow: hidden;';
+            (this.canvasHostElem || this.canvasElem.parentNode).appendChild(this.threeContainer);
+        } else if (this.threeContainer.parentNode !== (this.canvasHostElem || this.canvasElem.parentNode)) {
+            (this.canvasHostElem || this.canvasElem.parentNode).appendChild(this.threeContainer);
         }
         this.threeContainer.style.display = 'block';
 
@@ -3002,10 +3138,7 @@ class OpenPosePanel {
 
 
     exit3DMode() {
-
-        if (this.canvasElem) {
-            this.canvasElem.style.display = 'block';
-        }
+        this.set2DCanvasInteractive(true);
         if (this.threeContainer) {
             this.threeContainer.style.display = 'none';
         }
@@ -5275,12 +5408,17 @@ class OpenPosePanel {
 
 }
 
+if (globalThis[OPENPOSE_EDITOR_BOOTSTRAP_KEY]) {
+    console.warn(`[OpenPose3D] Duplicate frontend load skipped: ${import.meta.url}`);
+} else {
+    globalThis[OPENPOSE_EDITOR_BOOTSTRAP_KEY] = import.meta.url;
+
 app.registerExtension({
-    name: "Nui.OpenPoseEditor",
+    name: OPENPOSE_EDITOR_EXTENSION_NAME,
     setup() {
 
         api.addEventListener("beforeQueuePrompt", async (event) => {
-            const nodes = app.graph.nodes.filter(n => n.type === "Nui.OpenPoseEditor");
+            const nodes = app.graph.nodes.filter(n => n.type === OPENPOSE_EDITOR_NODE_NAME);
             for (const node of nodes) {
                 if (node.openPosePanel && node.openPosePanel.poseDescriptionText) {
                     const text = node.openPosePanel.poseDescriptionText.innerText;
@@ -5442,7 +5580,7 @@ app.registerExtension({
         });
     },
     async beforeRegisterNodeDef(nodeType, nodeData, app) {
-        if (nodeData.name !== "Nui.OpenPoseEditor") {
+        if (nodeData.name !== OPENPOSE_EDITOR_NODE_NAME) {
             return
         }
 
@@ -5987,16 +6125,11 @@ app.registerExtension({
                 panel.style.width = "900px";
                 panel.style.height = "850px";
 
-                let mask = document.getElementById("openpose-mask-container");
-                if (!mask) {
-                    mask = document.createElement("div");
-                    mask.id = "openpose-mask-container";
-                    mask.style.cssText = "position: fixed; top: 0; left: 0; width: 0; height: 0; z-index: 2147483647; pointer-events: none;";
-                    document.body.appendChild(mask);
-                }
-
-
-                mask.appendChild(panel);
+                const panelHost = document.createElement("div");
+                panelHost.className = "openpose-3d-panel-host";
+                panelHost.style.cssText = "position: fixed; inset: 0; z-index: 2147483647; pointer-events: none;";
+                document.body.appendChild(panelHost);
+                panelHost.appendChild(panel);
 
 
                 panel.style.position = "fixed";
@@ -6021,23 +6154,33 @@ app.registerExtension({
                 resizer.style.cursor = "se-resize";
                 panel.appendChild(resizer);
 
-
-
-                const keepAliveInterval = setInterval(() => {
-                    if (panel && mask && panel.parentElement !== mask) {
-                         mask.appendChild(panel);
-                    }
-
-
-                    if (!document.body.contains(mask)) {
-                        clearInterval(keepAliveInterval);
-                    }
-                }, 500);
-
-
                 const originalClose = panel.close;
                 const openPosePanel = this.openPosePanel;
+                let panelClosed = false;
+                let isResizing = false;
+                const handleResizeMove = (e) => {
+                    if (!isResizing) return;
+                    const rect = panel.getBoundingClientRect();
+                    panel.style.width = `${e.clientX - rect.left}px`;
+                    panel.style.height = `${e.clientY - rect.top}px`;
+                };
+                const handleResizeUp = () => {
+                    if (!isResizing) return;
+                    isResizing = false;
+                    this.openPosePanel?.resizeCanvas();
+                };
+                const cleanupPanelHost = () => {
+                    document.removeEventListener("mousemove", handleResizeMove);
+                    document.removeEventListener("mouseup", handleResizeUp);
+                    if (panelHost.parentNode) {
+                        panelHost.parentNode.removeChild(panelHost);
+                    }
+                };
                 panel.close = async function() {
+                    if (panelClosed) {
+                        return;
+                    }
+                    panelClosed = true;
 
                     if (openPosePanel) {
 
@@ -6110,30 +6253,17 @@ app.registerExtension({
 
                         openPosePanel.saveToNode();
                     }
-                    clearInterval(keepAliveInterval);
                     if (originalClose) originalClose.call(panel);
-                    if (mask && mask.parentNode) {
-                        mask.parentNode.removeChild(mask);
-                    }
+                    cleanupPanelHost();
                 };
 
-                let isResizing = false;
                 resizer.addEventListener("mousedown", (e) => {
                     e.preventDefault();
                     isResizing = true;
                 });
 
-                document.addEventListener("mousemove", (e) => {
-                    if (!isResizing) return;
-                    const rect = panel.getBoundingClientRect();
-                    panel.style.width = `${e.clientX - rect.left}px`;
-                    panel.style.height = `${e.clientY - rect.top}px`;
-                });
-
-                document.addEventListener("mouseup", () => {
-                    isResizing = false;
-                    this.openPosePanel.resizeCanvas()
-                });
+                document.addEventListener("mousemove", handleResizeMove);
+                document.addEventListener("mouseup", handleResizeUp);
             });
             this.openWidget.serialize = false;
 
@@ -6345,3 +6475,4 @@ app.registerExtension({
 
     }
 });
+}

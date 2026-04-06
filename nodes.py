@@ -343,7 +343,7 @@ class OpenPoseEditor:
 
     # 主函数：处理bridge_anything（IMAGE类型）
     def get_images(self, image, output_width_for_dwpose, output_height_for_dwpose, scale_for_xinsr_for_dwpose, 
-                    stop_for_edit, backgroundImage, poses_datas, bridge_anything=None, prev_image=None, pose_image=None, pose_point=None, 
+                    stop_for_edit, backgroundImage="", poses_datas="", bridge_anything=None, prev_image=None, pose_image=None, pose_point=None, 
                     unique_id=None):
         # 安全性检查：确保核心字符串参数不为 None
         if backgroundImage is None:
@@ -584,19 +584,19 @@ class OpenPoseEditor:
     # 生成姿态文字描述
     def generate_posture_description(self, poses_datas):
         if not poses_datas:
-            return "无姿态数据"
+            return "No pose data"
         
         try:
             data = json.loads(poses_datas)
             people = data.get("people", [])
             if not people:
-                return "无人物姿态"
+                return "No human pose"
             
             # 获取第一个人的关键点
             person = people[0]
             keypoints = person.get("pose_keypoints_2d", [])
             if not keypoints or len(keypoints) < 39:
-                return "关键点数据不完整"
+                return "Incomplete keypoint data"
             
             descriptions = []
             
@@ -626,40 +626,40 @@ class OpenPoseEditor:
                 # 身体倾斜判断
                 body_tilt = abs(shoulder_y - hip_y)
                 if body_tilt < 0.1:
-                    descriptions.append("身体水平")
+                    descriptions.append("body horizontal")
                 elif shoulder_y < hip_y - 0.1:
-                    descriptions.append("身体前倾")
+                    descriptions.append("body leaning forward")
                 elif shoulder_y > hip_y + 0.1:
-                    descriptions.append("身体后仰")
+                    descriptions.append("body leaning back")
                 else:
-                    descriptions.append("身体直立")
+                    descriptions.append("body upright")
             
             # 判断腿部姿态
             if left_hip and left_knee:
                 left_knee_forward = left_knee["y"] - left_hip["y"]
                 if left_knee_forward < -0.1:
-                    descriptions.append("左膝盖抬起")
+                    descriptions.append("left knee raised")
             
             if right_hip and right_knee:
                 right_knee_forward = right_knee["y"] - right_hip["y"]
                 if right_knee_forward < -0.1:
-                    descriptions.append("右膝盖抬起")
+                    descriptions.append("right knee raised")
             
             # 判断双腿分开
             if left_knee and right_knee:
                 knee_distance = abs(left_knee["x"] - right_knee["x"])
                 if knee_distance > 0.15:
-                    descriptions.append("双腿分开")
+                    descriptions.append("legs apart")
                 elif knee_distance < 0.05:
-                    descriptions.append("双腿并拢")
+                    descriptions.append("legs together")
             
             if descriptions:
-                return "，".join(descriptions)
+                return ", ".join(descriptions)
             else:
-                return "标准姿态"
+                return "neutral pose"
                 
         except Exception as e:
-            return f"姿态解析错误: {str(e)}"
+            return f"Pose parsing error: {str(e)}"
 
 # ====================================================================================================
 # SavePoseToJson 节点

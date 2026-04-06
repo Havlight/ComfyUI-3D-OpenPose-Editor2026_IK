@@ -1,57 +1,148 @@
 # ComfyUI-3D-OpenPose-Editor2026
 
+[繁體中文 README](./README.zh-TW.md)
 
-这是一个为 ComfyUI 设计的3D OpenPose 编辑器节点。支持实时匹配画布大小、一键匹配上游图片尺寸、3D姿态调整、自动提示词匹配等功能。
+A customized 2D/3D OpenPose editor node for ComfyUI, built for practical pose editing inside real workflows.
 
-## ✨ 主要功能
+This version keeps the original 2D editing flow, adds a full 3D editing mode, and includes a number of quality-of-life improvements such as reset view, FK/IK workflow, JSON naming on export, background image support, and frontend conflict fixes for mixed-editor setups.
 
-*   **3D 姿态编辑模式**：支持在 3D 空间中编辑姿态，提供更直观的操作体验。
-*   **姿态文本自动输出**：自动识别当前姿态并生成文字描述，通过 `Posture Text` 端口输出。
-*   **交互体验优化**：
-    *   ✅ **修复鼠标中键拖拽**：原生支持按住鼠标中键拖拽画布，解决兼容性问题。
-    *   支持 `Alt + 左键` 拖拽画布。
-    *   支持鼠标滚轮平滑缩放。
-*   **工作流深度集成**：
-<img width="716" height="673" alt="QQ20260301-211649" src="https://github.com/user-attachments/assets/f8726dc0-7198-4045-b1dc-ffe96687441d" />
-<img width="741" height="821" alt="QQ20260301-211748" src="https://github.com/user-attachments/assets/e7b4b9f0-c9d5-4c15-9cbd-9ccf74811255" />
-<img width="1307" height="709" alt="QQ20260301-211845" src="https://github.com/user-attachments/assets/214df6d5-6ffc-44d5-b147-def42e5734ff" />
+The current UI in this custom build is English, including toolbar buttons, panel labels, prompts, and runtime status messages.
 
-此节点在https://github.com/DocWorkBox/ComfyUI-OpenPose-Editor-DocKr 的基础上进行功能扩展，如没3D编辑需求可使用原作者的2DOpenPose Editor。原DocKr 2D模式保留，可自由切换。
-## 🎮 3D 模式操作指南
+## Screenshots
 
-### 进入 3D 模式
-点击编辑器底部的 **"3D模式: 开"** 按钮切换到 3D 编辑模式。
+### Node
 
-### 3D 视图操作
+![Node Screenshot](./node.png)
 
-| 操作 | 说明 |
-|------|------|
-| **鼠标右键按住** | 旋转 3D 模型视角（360度自由旋转） |
-| **鼠标滚轮** | 缩放视图 |
-| **鼠标左键拖拽** | 移动选中的关节点 |
-| **鼠标中间按住** | 平移模型 |
+### 3D Editor
 
-### 3D 模式特色功能
+![3D Editor Screenshot](./3dEditor.png)
 
-*   **Gizmo 控件**：选中关节点后显示红绿蓝三色箭头，可沿 X/Y/Z 轴精确移动。
-*   **实时姿态识别**：3D 模式下实时分析姿态，自动生成文字描述。
-*   **多角度查看**：自由旋转查看姿态的各个角度。
-*   **自动同步 2D**：3D 姿态自动同步到 2D 视图，方便导出。
+## Features
 
-## 📝 姿态文本输出功能
+- 2D and 3D pose editing in a single node
+- Reset View button to restore the initial camera angle and zoom
+- FK-style joint editing for controlled axis-based adjustments
+- IK support for arms and legs while preserving limb lengths
+- Built-in gizmo for X/Y/Z movement and rotation
+- Save pose JSON with a custom filename dialog
+- Load and restore saved 3D pose data, camera state, and model rotation
+- Background image loading for pose matching
+- Pose auto-completion for missing limbs and mirrored joints
+- Posture text output for downstream prompt or workflow usage
+- Better coexistence with other OpenPose editors in the same ComfyUI frontend
 
+## Installation
 
-### 使用方式
-请用以下文本配合姿态文本使用：
+Clone or copy this repository into your ComfyUI `custom_nodes` folder:
 
-保持图1中人物的所有服装、发型、面部特征、配饰和场景背景完全不变，严格按照图2提供的3D姿态参考图重新调整人物全身姿态，包括所有关节的位置和角度，确保人物四肢完整，无缺失或扭曲，动作自然流畅，符合人体工学，保持画面的光影、色彩和整体风格与原图一致，生成高质量、细节丰富的图像，无明显AI生成痕迹。
+```bash
+cd ComfyUI/custom_nodes
+git clone <your-repo-url> ComfyUI-3D-OpenPose-Editor2026
+```
 
-姿态文本自动通过 `Posture Text` 输出端口输出，可连接到其他节点使用。
+Then restart ComfyUI.
 
-**注意**：
-姿态文本在运行工作流时自动更新，确保输出的是当前编辑器的最新姿态描述。
-姿态识别不好时请打开scale_for_xinsr_for_dwpose
+If you are updating from an older local copy, a full browser hard refresh is recommended after restart.
 
-## 🤝 反馈和二次开发
+## Quick Start
 
-如果您在使用中遇到问题或有新的建议，欢迎提交 Issue。也希望其他大神能再次开发加入3D模型人物。
+1. Add the `Nui.OpenPoseEditor` node to your workflow.
+2. Open the editor panel from the node.
+3. Edit the pose in 2D or switch to 3D mode.
+4. Use the built-in buttons such as `Open Pose Editor`, `Match Size`, and `Apply Pose` as needed.
+5. Save or load pose JSON files as needed.
+6. Use the node output in your downstream pose-driven workflow.
+
+## Toolbar Overview
+
+| Button | Description |
+| --- | --- |
+| `Add` | Add a new pose |
+| `Delete Points` | Delete selected joints |
+| `Clear` | Clear the current pose |
+| `Reset` | Reset to the original loaded pose |
+| `Save` | Export pose JSON with a custom filename(compatible with andreszs/ComfyUI-OpenPose-Studio's json format) |
+| `Load` | Import a saved pose JSON(compatible with andreszs/ComfyUI-OpenPose-Studio's json format) |
+| `Select All` | Select all available joints |
+| `Auto Complete` | Auto-complete missing joints and limb connections |
+| `Background` | Load a background image |
+| `Clear Background` | Remove the background image |
+| `3D Mode: On / Off` | Toggle 2D / 3D editing mode |
+| `Gizmo: On / Off` | Toggle the 3D gizmo |
+| `Reset View` | Reset the 3D camera to the initial view |
+| `Mode: FK / IK` | Switch between FK and IK editing |
+
+## 3D Controls
+
+| Action | Description |
+| --- | --- |
+| Left click | Select a joint or gizmo handle |
+| Left drag | Move the selected joint or drag in free space |
+| Right drag | Rotate the camera |
+| Middle drag | Pan the camera |
+| Mouse wheel | Zoom in or out |
+
+## Shortcuts
+
+| Shortcut | Description |
+| --- | --- |
+| `Ctrl + A` | Select all joints |
+| `Delete` / `Backspace` | Delete selected joints in 3D mode |
+| `Esc` | Clear selection |
+| `R` | Reset 3D view |
+| `F` | Switch to FK mode |
+| `I` | Switch to IK mode |
+| `Ctrl + Z` | Undo |
+| `Ctrl + Y` | Redo |
+
+## Node Widgets
+
+The node-level widgets shown in the ComfyUI graph are also in English:
+
+- `Open Pose Editor`
+- `Match Size`
+- `Apply Pose`
+
+## FK and IK Workflow
+
+### FK
+
+Use FK mode when you want to rotate or move a joint while keeping downstream joints following the chain. This is useful for shaping arms, legs, and overall motion arcs from a stable parent joint.
+
+### IK
+
+Use IK mode when you want to drag an end effector such as a wrist or ankle while keeping limb lengths stable. The current implementation focuses on two-bone chains:
+
+- Left arm
+- Right arm
+- Left leg
+- Right leg
+
+## Save Format
+
+Exported JSON includes:
+
+- 2D projected pose data
+- 3D point data
+- 3D connection data
+- camera state
+- model rotation
+- orbit center
+
+This makes it possible to reopen a pose and continue editing from the same 3D state.
+
+## Notes
+
+- This project is based on the DocKr OpenPose Editor and extends it with additional 3D editing features and workflow fixes.
+- If you use another OpenPose editor plugin in the same ComfyUI session, make sure your browser cache is refreshed after updating.
+- The current IK implementation is focused on common limb editing, not a full character rig system.
+
+## Credits
+
+- Original 2D editor base: DocKr OpenPose Editor
+- Extended and customized for mixed 2D/3D workflow editing in ComfyUI
+
+## License
+
+Please update this section to match the license you intend to publish with your GitHub version.

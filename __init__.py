@@ -41,7 +41,7 @@ check_and_install_dependencies()
 from .nodes import NODE_CLASS_MAPPINGS, NODE_DISPLAY_NAME_MAPPINGS
 import time
 
-WEB_DIRECTORY = "./js"
+WEB_DIRECTORY = "./web"
 __all__ = ['NODE_CLASS_MAPPINGS', 'NODE_DISPLAY_NAME_MAPPINGS', 'WEB_DIRECTORY']
 
 # 添加时间戳强制刷新缓存
