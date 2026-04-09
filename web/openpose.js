@@ -146,6 +146,7 @@ const OPENPOSE_LEFT_RIGHT_PAIRS = [
     [14, 15], [16, 17],
 ];
 const OPENPOSE_CENTERLINE_IDS = [0, 1];
+const OPENPOSE_HEAD_IDS = [0, 14, 15, 16, 17];
 
 const POSE_PARENT_MAP = {
     0: 1,
@@ -2928,6 +2929,7 @@ class OpenPosePanel {
             return false;
         }
 
+        const headJointIds = new Set(OPENPOSE_HEAD_IDS);
         const pairJointIds = new Set(OPENPOSE_LEFT_RIGHT_PAIRS.flat());
         targetPoseIds.forEach(poseId => {
             const posePoints = this.threePoseData.points.filter(point => point.poseId === poseId);
@@ -2953,6 +2955,10 @@ class OpenPosePanel {
             );
 
             OPENPOSE_LEFT_RIGHT_PAIRS.forEach(([leftId, rightId]) => {
+                if (headJointIds.has(leftId) || headJointIds.has(rightId)) {
+                    return;
+                }
+
                 const leftLocal = localSnapshot.get(leftId);
                 const rightLocal = localSnapshot.get(rightId);
                 if (!leftLocal && !rightLocal) {
@@ -2977,6 +2983,10 @@ class OpenPosePanel {
             });
 
             OPENPOSE_CENTERLINE_IDS.forEach(jointId => {
+                if (headJointIds.has(jointId)) {
+                    return;
+                }
+
                 const localPoint = localSnapshot.get(jointId);
                 if (!localPoint) {
                     return;
@@ -2989,7 +2999,7 @@ class OpenPosePanel {
             });
 
             posePoints.forEach(point => {
-                if (pairJointIds.has(point.id) || OPENPOSE_CENTERLINE_IDS.includes(point.id)) {
+                if (headJointIds.has(point.id) || pairJointIds.has(point.id) || OPENPOSE_CENTERLINE_IDS.includes(point.id)) {
                     return;
                 }
                 const localPoint = localSnapshot.get(point.id);
@@ -3024,6 +3034,7 @@ class OpenPosePanel {
         }
 
         const isLeftToRight = direction === "left_to_right";
+        const headJointIds = new Set(OPENPOSE_HEAD_IDS);
         targetPoseIds.forEach(poseId => {
             const posePoints = this.threePoseData.points.filter(point => point.poseId === poseId);
             if (posePoints.length === 0) {
@@ -3048,6 +3059,10 @@ class OpenPosePanel {
             );
 
             OPENPOSE_LEFT_RIGHT_PAIRS.forEach(([leftId, rightId]) => {
+                if (headJointIds.has(leftId) || headJointIds.has(rightId)) {
+                    return;
+                }
+
                 const sourceId = isLeftToRight ? leftId : rightId;
                 const targetId = isLeftToRight ? rightId : leftId;
                 const sourceLocal = localSnapshot.get(sourceId);
