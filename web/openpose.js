@@ -126,6 +126,19 @@ const DEFAULT_THREE_CAMERA_STATE = { theta: 0, phi: Math.PI / 2, radius: 500 };
 const DEFAULT_BACKGROUND_TYPE = "input";
 const DEFAULT_BACKGROUND_OPACITY = 0.6;
 const DEFAULT_THREE_SCENE_BACKGROUND = 0x000000;
+const CAMERA_ORBIT_SPEED = 0.008;
+const CAMERA_MIN_PHI = 0.08;
+const CAMERA_MAX_PHI = Math.PI - CAMERA_MIN_PHI;
+const CAMERA_MIN_RADIUS = 60;
+const CAMERA_MAX_RADIUS = 5000;
+const CAMERA_FRAME_PADDING = 1.35;
+const CAMERA_PRESETS = {
+    front: { theta: 0, phi: Math.PI / 2 },
+    back: { theta: Math.PI, phi: Math.PI / 2 },
+    left: { theta: -Math.PI / 2, phi: Math.PI / 2 },
+    right: { theta: Math.PI / 2, phi: Math.PI / 2 },
+    top: { theta: 0, phi: CAMERA_MIN_PHI * 1.5 },
+};
 
 const POSE_PARENT_MAP = {
     0: 1,
@@ -1825,6 +1838,55 @@ class OpenPosePanel {
         });
         this.resetViewButton.title = "Restore the initial camera angle and zoom for the current pose";
 
+        this.frontViewButton = this.panel.addButton("Front", () => {
+            if (this.is3DMode) {
+                this.setCameraPreset("front");
+            }
+        });
+        this.frontViewButton.title = "Look at the pose from the default front view";
+
+        this.backViewButton = this.panel.addButton("Back", () => {
+            if (this.is3DMode) {
+                this.setCameraPreset("back");
+            }
+        });
+        this.backViewButton.title = "Look at the pose from the back";
+
+        this.leftViewButton = this.panel.addButton("Left", () => {
+            if (this.is3DMode) {
+                this.setCameraPreset("left");
+            }
+        });
+        this.leftViewButton.title = "Look at the pose from the subject's left side";
+
+        this.rightViewButton = this.panel.addButton("Right", () => {
+            if (this.is3DMode) {
+                this.setCameraPreset("right");
+            }
+        });
+        this.rightViewButton.title = "Look at the pose from the subject's right side";
+
+        this.topViewButton = this.panel.addButton("Top", () => {
+            if (this.is3DMode) {
+                this.setCameraPreset("top");
+            }
+        });
+        this.topViewButton.title = "Look down at the pose from above";
+
+        this.frameAllButton = this.panel.addButton("Frame All", () => {
+            if (this.is3DMode) {
+                this.frameModel();
+            }
+        });
+        this.frameAllButton.title = "Center and frame the full pose";
+
+        this.focusSelectionButton = this.panel.addButton("Focus", () => {
+            if (this.is3DMode) {
+                this.focusSelection();
+            }
+        });
+        this.focusSelectionButton.title = "Center and frame the current 3D selection";
+
         this.rigModeButton = this.panel.addButton("Mode: FK", () => {
             this.threeRigMode = this.threeRigMode === "fk" ? "ik" : "fk";
             this.updateRigModeButton();
@@ -2017,6 +2079,74 @@ class OpenPosePanel {
         return new THREE.Vector3(center.x, center.y, center.z);
     }
 
+    normalizeThreeCameraState(cameraState = this.threeCameraState) {
+        const baseState = cameraState || DEFAULT_THREE_CAMERA_STATE;
+        const theta = Number.isFinite(baseState.theta) ? baseState.theta : DEFAULT_THREE_CAMERA_STATE.theta;
+        const phi = Number.isFinite(baseState.phi) ? baseState.phi : DEFAULT_THREE_CAMERA_STATE.phi;
+        const radius = Number.isFinite(baseState.radius) ? baseState.radius : DEFAULT_THREE_CAMERA_STATE.radius;
+
+        return {
+            theta,
+            phi: Math.min(CAMERA_MAX_PHI, Math.max(CAMERA_MIN_PHI, phi)),
+            radius: Math.min(CAMERA_MAX_RADIUS, Math.max(CAMERA_MIN_RADIUS, radius)),
+        };
+    }
+
+    ensureThreeOrbitCenter(fallbackCenter = null) {
+        const THREE = window.THREE || globalThis.THREE;
+        if (!THREE) {
+            return null;
+        }
+
+        if (this.threeOrbitCenter) {
+            return this.threeOrbitCenter;
+        }
+
+        const center = fallbackCenter || this.getModelCenter();
+        if (center) {
+            this.threeOrbitCenter = new THREE.Vector3(center.x, center.y, center.z);
+        } else {
+            this.threeOrbitCenter = new THREE.Vector3(0, 0, 0);
+        }
+
+        return this.threeOrbitCenter;
+    }
+
+    get3DPointObjects(sourceObjects = null) {
+        if (Array.isArray(sourceObjects)) {
+            return sourceObjects.filter(obj => obj?.userData && obj.userData.pointData);
+        }
+
+        const pointObjects = [];
+        this.threeObjects?.forEach((obj, key) => {
+            if (key.startsWith("point_")) {
+                pointObjects.push(obj);
+            }
+        });
+        return pointObjects;
+    }
+
+    get3DBounds(sourceObjects = null) {
+        const THREE = window.THREE || globalThis.THREE;
+        if (!THREE) {
+            return null;
+        }
+
+        const pointObjects = this.get3DPointObjects(sourceObjects);
+        if (pointObjects.length === 0) {
+            return null;
+        }
+
+        const box = new THREE.Box3();
+        pointObjects.forEach(obj => box.expandByPoint(obj.position));
+
+        const center = box.getCenter(new THREE.Vector3());
+        const size = box.getSize(new THREE.Vector3());
+        const sphere = box.getBoundingSphere(new THREE.Sphere());
+
+        return { box, center, size, sphere, objects: pointObjects };
+    }
+
     syncThreeCameraStateFromCamera() {
         if (!this.threeCamera) {
             return;
@@ -2029,11 +2159,11 @@ class OpenPosePanel {
         const phi = Math.acos(Math.max(-1, Math.min(1, offset.y / radius)));
         const theta = Math.atan2(offset.x, offset.z);
 
-        this.threeCameraState = {
+        this.threeCameraState = this.normalizeThreeCameraState({
             theta,
             phi,
             radius,
-        };
+        });
     }
 
     applyThreeCameraState(cameraState = this.threeCameraState, orbitCenter = this.threeOrbitCenter) {
@@ -2042,14 +2172,135 @@ class OpenPosePanel {
         }
 
         const THREE = window.THREE || globalThis.THREE;
-        const center = orbitCenter || new THREE.Vector3(0, 0, 0);
-        const { theta, phi, radius } = cameraState;
+        const center = orbitCenter || this.ensureThreeOrbitCenter() || new THREE.Vector3(0, 0, 0);
+        const { theta, phi, radius } = this.normalizeThreeCameraState(cameraState);
 
         this.threeCamera.position.x = center.x + radius * Math.sin(phi) * Math.sin(theta);
         this.threeCamera.position.y = center.y + radius * Math.cos(phi);
         this.threeCamera.position.z = center.z + radius * Math.sin(phi) * Math.cos(theta);
         this.threeCamera.lookAt(center);
         this.syncThreeCameraStateFromCamera();
+    }
+
+    orbitCameraByDelta(deltaX, deltaY) {
+        if (!this.threeCamera) {
+            return;
+        }
+
+        this.ensureThreeOrbitCenter();
+        const nextState = this.normalizeThreeCameraState({
+            ...(this.threeCameraState || DEFAULT_THREE_CAMERA_STATE),
+            theta: (this.threeCameraState?.theta ?? DEFAULT_THREE_CAMERA_STATE.theta) + deltaX * CAMERA_ORBIT_SPEED,
+            phi: (this.threeCameraState?.phi ?? DEFAULT_THREE_CAMERA_STATE.phi) + deltaY * CAMERA_ORBIT_SPEED,
+        });
+
+        this.applyThreeCameraState(nextState, this.threeOrbitCenter);
+        this.update3DStatus();
+    }
+
+    panCameraByDelta(deltaX, deltaY) {
+        if (!this.threeCamera) {
+            return;
+        }
+
+        const THREE = window.THREE || globalThis.THREE;
+        const center = this.ensureThreeOrbitCenter();
+        if (!center) {
+            return;
+        }
+
+        const rendererHeight = Math.max(this.threeRenderer?.domElement?.clientHeight || 0, 1);
+        const distance = this.threeCamera.position.distanceTo(center);
+        const fov = this.threeCamera.fov * (Math.PI / 180);
+        const worldUnitsPerPixel = (2 * distance * Math.tan(fov / 2)) / rendererHeight;
+
+        const right = new THREE.Vector3(1, 0, 0).applyQuaternion(this.threeCamera.quaternion);
+        const up = new THREE.Vector3(0, 1, 0).applyQuaternion(this.threeCamera.quaternion);
+        const delta = new THREE.Vector3()
+            .addScaledVector(right, -deltaX * worldUnitsPerPixel)
+            .addScaledVector(up, deltaY * worldUnitsPerPixel);
+
+        this.threeCamera.position.add(delta);
+        center.add(delta);
+        this.syncThreeCameraStateFromCamera();
+        this.update3DStatus();
+    }
+
+    zoomCameraByDelta(deltaY) {
+        if (!this.threeCamera) {
+            return;
+        }
+
+        this.ensureThreeOrbitCenter();
+        const zoomScale = Math.exp(deltaY * 0.0015);
+        const nextState = this.normalizeThreeCameraState({
+            ...(this.threeCameraState || DEFAULT_THREE_CAMERA_STATE),
+            radius: (this.threeCameraState?.radius ?? DEFAULT_THREE_CAMERA_STATE.radius) * zoomScale,
+        });
+
+        this.applyThreeCameraState(nextState, this.threeOrbitCenter);
+        this.update3DStatus();
+    }
+
+    frameObjects3D(sourceObjects, { preserveAngles = true, padding = CAMERA_FRAME_PADDING } = {}) {
+        if (!this.threeCamera) {
+            return;
+        }
+
+        const bounds = this.get3DBounds(sourceObjects);
+        if (!bounds) {
+            return;
+        }
+
+        const THREE = window.THREE || globalThis.THREE;
+        const center = bounds.center.clone();
+        const sphereRadius = Math.max(bounds.sphere.radius, 1);
+        const halfFovY = (this.threeCamera.fov * Math.PI / 180) / 2;
+        const halfFovX = Math.atan(Math.tan(halfFovY) * this.threeCamera.aspect);
+        const fitByHeight = sphereRadius / Math.sin(Math.max(halfFovY, 0.001));
+        const fitByWidth = sphereRadius / Math.sin(Math.max(halfFovX, 0.001));
+        const radius = Math.max(CAMERA_MIN_RADIUS, fitByHeight, fitByWidth) * padding;
+
+        this.threeOrbitCenter = new THREE.Vector3(center.x, center.y, center.z);
+        const nextState = preserveAngles
+            ? this.normalizeThreeCameraState({ ...(this.threeCameraState || DEFAULT_THREE_CAMERA_STATE), radius })
+            : this.normalizeThreeCameraState({ ...DEFAULT_THREE_CAMERA_STATE, radius });
+
+        this.applyThreeCameraState(nextState, this.threeOrbitCenter);
+        this.updateTransformGizmo();
+        this.update3DSelectionBox();
+        this.update3DStatus();
+    }
+
+    frameModel(options = {}) {
+        this.frameObjects3D(this.get3DPointObjects(), options);
+    }
+
+    focusSelection() {
+        const selectedObjects = this.get3DSelectedPointObjects();
+        if (selectedObjects.length > 0) {
+            this.frameObjects3D(selectedObjects);
+            return;
+        }
+
+        this.frameModel();
+    }
+
+    setCameraPreset(name) {
+        const preset = CAMERA_PRESETS[name];
+        if (!preset || !this.threeCamera) {
+            return;
+        }
+
+        this.ensureThreeOrbitCenter();
+        const nextState = this.normalizeThreeCameraState({
+            ...(this.threeCameraState || DEFAULT_THREE_CAMERA_STATE),
+            theta: preset.theta,
+            phi: preset.phi,
+        });
+
+        this.applyThreeCameraState(nextState, this.threeOrbitCenter);
+        this.update3DStatus();
     }
 
     captureCurrent3DViewState() {
@@ -2144,12 +2395,17 @@ class OpenPosePanel {
             return;
         }
 
+        if (!this.is3DMode) {
+            this.statusTextEl.textContent = "Mode: 2D";
+            return;
+        }
+
         const selectedObjects = this.get3DSelectedPointObjects();
         const selectedLabel = selectedObjects.length === 1
             ? (JOINT_NAMES[selectedObjects[0].userData.id] || `Joint ${selectedObjects[0].userData.id}`)
             : `${selectedObjects.length} selected`;
         const selectionText = selectedObjects.length > 0 ? selectedLabel : "No selection";
-        this.statusTextEl.textContent = `Mode: ${this.threeRigMode.toUpperCase()} | ${selectionText}`;
+        this.statusTextEl.textContent = `Mode: ${this.threeRigMode.toUpperCase()} | Cam: Orbit | ${selectionText}`;
     }
 
     promptForPoseFilename(defaultFilename) {
@@ -3406,6 +3662,7 @@ class OpenPosePanel {
 
         const THREE = window.THREE;
         this.syncThreeCameraStateFromCamera();
+        this.threeCameraState = this.normalizeThreeCameraState(this.threeCameraState);
         const people = [];
 
 
@@ -3907,6 +4164,7 @@ class OpenPosePanel {
         try {
 
             const json = JSON.parse(text);
+            let restoredCameraState = false;
 
             const canvasWidth = Number(json["width"] ?? json["canvas_width"]);
             const canvasHeight = Number(json["height"] ?? json["canvas_height"]);
@@ -3972,6 +4230,7 @@ class OpenPosePanel {
 
                 if (json["_3d_pose_data"].camera_state) {
                     this.threeCameraState = json["_3d_pose_data"].camera_state;
+                    restoredCameraState = true;
                     console.log('[OpenPose] Restored camera state:', this.threeCameraState);
                 }
 
@@ -3987,6 +4246,7 @@ class OpenPosePanel {
                 if (json["_3d_pose_data"].orbit_center) {
                     const oc = json["_3d_pose_data"].orbit_center;
                     this.threeOrbitCenter = new THREE.Vector3(oc.x, oc.y, oc.z);
+                    restoredCameraState = true;
                     console.log('[OpenPose] Restored orbit center:', oc);
                 }
             } else {
@@ -4027,6 +4287,10 @@ class OpenPosePanel {
                 }
 
                 this.render3DPose();
+
+                if (!restoredCameraState) {
+                    this.frameModel({ preserveAngles: true });
+                }
             }
 
             if (json["_3d_pose_data"]) {
@@ -4133,8 +4397,8 @@ class OpenPosePanel {
         await this.syncThreeSceneBackgroundFromNode();
 
 
-
         let restoredFromJSON = false;
+        let restoredCameraState = false;
 
         if (!this.threePoseData || this.threePoseData.points.length === 0) {
 
@@ -4179,6 +4443,7 @@ class OpenPosePanel {
 
                     if (poseData["_3d_pose_data"].camera_state) {
                         this.threeCameraState = poseData["_3d_pose_data"].camera_state;
+                        restoredCameraState = true;
                         console.log('[OpenPose] Restored camera state:', this.threeCameraState);
                     }
 
@@ -4195,6 +4460,7 @@ class OpenPosePanel {
                         const oc = poseData["_3d_pose_data"].orbit_center;
                         const THREE = window.THREE;
                         this.threeOrbitCenter = new THREE.Vector3(oc.x, oc.y, oc.z);
+                        restoredCameraState = true;
                         console.log('[OpenPose] Restored orbit center from JSON:', oc);
                     }
                 }
@@ -4205,21 +4471,16 @@ class OpenPosePanel {
 
 
         if (this.threeCamera && this.threeCameraState) {
-            const center = this.threeOrbitCenter || new THREE.Vector3(0, 0, 0);
-            const radius = this.threeCameraState.radius;
-            const theta = this.threeCameraState.theta;
-            const phi = this.threeCameraState.phi;
-
-
-            this.threeCamera.position.x = center.x + radius * Math.sin(phi) * Math.sin(theta);
-            this.threeCamera.position.y = center.y + radius * Math.cos(phi);
-            this.threeCamera.position.z = center.z + radius * Math.sin(phi) * Math.cos(theta);
-            this.threeCamera.lookAt(center);
+            this.applyThreeCameraState(this.threeCameraState, this.threeOrbitCenter || new THREE.Vector3(0, 0, 0));
             console.log('[OpenPose] Applied camera state:', this.threeCameraState);
         }
 
 
         this.render3DPose();
+
+        if (!restoredCameraState) {
+            this.frameModel({ preserveAngles: true });
+        }
 
 
         this.animate3D();
@@ -4354,114 +4615,14 @@ class OpenPosePanel {
         let isRotating = false;
         let mouseX = 0;
         let mouseY = 0;
-        let rotateCenter = null;
 
+        const cameraElement = this.threeRenderer.domElement;
 
-        const getModelCenter = () => {
-            let centerX = 0, centerY = 0, centerZ = 0, count = 0;
-            this.threeObjects.forEach((obj, key) => {
-                if (key.startsWith('point_')) {
-                    centerX += obj.position.x;
-                    centerY += obj.position.y;
-                    centerZ += obj.position.z;
-                    count++;
-                }
-            });
-            if (count > 0) {
-                return new THREE.Vector3(centerX / count, centerY / count, centerZ / count);
-            }
-            return new THREE.Vector3(0, 0, 0);
-        };
-
-
-        const rotateModel = (deltaX, deltaY) => {
-            if (!rotateCenter) return;
-
-            const THREE = window.THREE;
-            const rotateSpeed = 0.01;
-
-
-
-            const angleX = deltaY * rotateSpeed;
-            const angleY = deltaX * rotateSpeed;
-
-
-            if (!this._tempDeltaQuaternion) {
-                this._tempDeltaQuaternion = new THREE.Quaternion();
-            }
-
-
-            if (Math.abs(deltaY) > 0.1) {
-                const axisX = this.getGizmoWorldAxis('x');
-                this._tempDeltaQuaternion.setFromAxisAngle(axisX, angleX);
-
-
-                this.threeObjects.forEach((obj, key) => {
-                    if (key.startsWith('point_')) {
-                        const relativePos = new THREE.Vector3().subVectors(obj.position, rotateCenter);
-                        relativePos.applyQuaternion(this._tempDeltaQuaternion);
-                        obj.position.addVectors(rotateCenter, relativePos);
-
-                        if (obj.userData.pointData) {
-                            obj.userData.pointData.x = obj.position.x;
-                            obj.userData.pointData.y = obj.position.y;
-                            obj.userData.pointData.z = obj.position.z;
-                        }
-                    }
-                });
-
-
-                if (!this.threeModelQuaternion) {
-                    this.threeModelQuaternion = new THREE.Quaternion();
-                }
-                this.threeModelQuaternion.premultiply(this._tempDeltaQuaternion);
-            }
-
-
-            if (Math.abs(deltaX) > 0.1) {
-                const axisY = this.getGizmoWorldAxis('y');
-                this._tempDeltaQuaternion.setFromAxisAngle(axisY, angleY);
-
-
-                this.threeObjects.forEach((obj, key) => {
-                    if (key.startsWith('point_')) {
-                        const relativePos = new THREE.Vector3().subVectors(obj.position, rotateCenter);
-                        relativePos.applyQuaternion(this._tempDeltaQuaternion);
-                        obj.position.addVectors(rotateCenter, relativePos);
-
-                        if (obj.userData.pointData) {
-                            obj.userData.pointData.x = obj.position.x;
-                            obj.userData.pointData.y = obj.position.y;
-                            obj.userData.pointData.z = obj.position.z;
-                        }
-                    }
-                });
-
-
-                if (!this.threeModelQuaternion) {
-                    this.threeModelQuaternion = new THREE.Quaternion();
-                }
-                this.threeModelQuaternion.premultiply(this._tempDeltaQuaternion);
-            }
-
-
-            this.updateAll3DLines();
-
-
-            this.updateTransformGizmo();
-
-
-            this.threeTransformCenter = rotateCenter.clone();
-        };
-
-
-        this.threeRenderer.domElement.addEventListener('mousedown', (e) => {
+        cameraElement.addEventListener('mousedown', (e) => {
             if (e.button === 2) {
                 isRotating = true;
                 mouseX = e.clientX;
                 mouseY = e.clientY;
-
-                rotateCenter = getModelCenter();
                 e.preventDefault();
             }
         });
@@ -4470,7 +4631,7 @@ class OpenPosePanel {
         let isPanning = false;
         let panStartX = 0;
         let panStartY = 0;
-        this.threeRenderer.domElement.addEventListener('mousedown', (e) => {
+        cameraElement.addEventListener('mousedown', (e) => {
             if (e.button === 1) {
                 isPanning = true;
                 panStartX = e.clientX;
@@ -4480,13 +4641,12 @@ class OpenPosePanel {
         });
 
 
-        this.threeRenderer.domElement.addEventListener('mousemove', (e) => {
+        const handlePointerMove = (e) => {
             if (isRotating) {
                 const deltaX = e.clientX - mouseX;
                 const deltaY = e.clientY - mouseY;
 
-
-                rotateModel(deltaX, deltaY);
+                this.orbitCameraByDelta(deltaX, deltaY);
 
                 mouseX = e.clientX;
                 mouseY = e.clientY;
@@ -4494,55 +4654,39 @@ class OpenPosePanel {
                 const deltaX = e.clientX - panStartX;
                 const deltaY = e.clientY - panStartY;
 
-
-                const camera = this.threeCamera;
-                const panSpeed = 0.5;
-
-
-                const right = new THREE.Vector3(1, 0, 0).applyQuaternion(camera.quaternion);
-                const up = new THREE.Vector3(0, 1, 0).applyQuaternion(camera.quaternion);
-
-
-                camera.position.addScaledVector(right, -deltaX * panSpeed);
-                camera.position.addScaledVector(up, deltaY * panSpeed);
-
-
-                if (this.threeOrbitCenter) {
-                    this.threeOrbitCenter.addScaledVector(right, -deltaX * panSpeed);
-                    this.threeOrbitCenter.addScaledVector(up, deltaY * panSpeed);
-                }
-
-                this.syncThreeCameraStateFromCamera();
+                this.panCameraByDelta(deltaX, deltaY);
 
                 panStartX = e.clientX;
                 panStartY = e.clientY;
             }
-        });
+        };
+        window.addEventListener('mousemove', handlePointerMove);
 
 
-        this.threeRenderer.domElement.addEventListener('mouseup', (e) => {
+        const handlePointerUp = (e) => {
             if (e.button === 2) {
                 isRotating = false;
             } else if (e.button === 1) {
                 isPanning = false;
             }
-        });
+        };
+        window.addEventListener('mouseup', handlePointerUp);
 
 
-        this.threeRenderer.domElement.addEventListener('contextmenu', (e) => {
+        cameraElement.addEventListener('contextmenu', (e) => {
             e.preventDefault();
         });
 
 
-        this.threeRenderer.domElement.addEventListener('wheel', (e) => {
+        cameraElement.addEventListener('wheel', (e) => {
             e.preventDefault();
-            const zoomSpeed = 5;
-
-
-            const forward = new THREE.Vector3(0, 0, -1).applyQuaternion(this.threeCamera.quaternion);
-            this.threeCamera.position.add(forward.multiplyScalar(-e.deltaY * zoomSpeed * 0.1));
-            this.syncThreeCameraStateFromCamera();
+            this.zoomCameraByDelta(e.deltaY);
         }, { passive: false });
+
+        this._threeOrbitControlCleanup = () => {
+            window.removeEventListener('mousemove', handlePointerMove);
+            window.removeEventListener('mouseup', handlePointerUp);
+        };
 
 
         this.setup3DInteraction();
@@ -6453,16 +6597,7 @@ class OpenPosePanel {
 
 
         if (this.threeCamera) {
-            const center = this.threeOrbitCenter;
-            const radius = 500;
-            const theta = 0;
-            const phi = Math.PI / 2;
-
-
-            this.threeCamera.position.x = center.x + radius * Math.sin(phi) * Math.sin(theta);
-            this.threeCamera.position.y = center.y + radius * Math.cos(phi);
-            this.threeCamera.position.z = center.z + radius * Math.sin(phi) * Math.cos(theta);
-            this.threeCamera.lookAt(center);
+            this.applyThreeCameraState(this.threeCameraState, this.threeOrbitCenter);
         }
 
         if (!this.threePoseData) {
@@ -6513,6 +6648,7 @@ class OpenPosePanel {
 
 
         this.render3DPose();
+        this.frameModel({ preserveAngles: true });
         this.recordInitial3DViewState();
     }
 
@@ -7345,6 +7481,10 @@ app.registerExtension({
                     panelClosed = true;
 
                     if (openPosePanel) {
+                        if (openPosePanel._threeOrbitControlCleanup) {
+                            openPosePanel._threeOrbitControlCleanup();
+                            openPosePanel._threeOrbitControlCleanup = null;
+                        }
 
                         if (openPosePanel.threePoseData && openPosePanel.threePoseData.points.length > 0) {
                             console.log('[OpenPose] Saving 3D pose data:', openPosePanel.threePoseData.points.length, 'points');
