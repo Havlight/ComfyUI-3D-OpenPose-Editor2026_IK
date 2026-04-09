@@ -71,6 +71,9 @@ If you are updating from an older local copy, a full browser hard refresh is rec
 | `3D Mode: On / Off` | Toggle 2D / 3D editing mode |
 | `Gizmo: On / Off` | Toggle the 3D gizmo |
 | `Reset View` | Reset the 3D camera to the initial view |
+| `Frame` | Frame the current 3D selection, or all points if nothing is selected |
+| `Nav: Orbit / Model` | Switch between orbiting the camera and rotating the model |
+| `Pivot: Model / Selection` | Set the camera pivot from the model center or the current selection |
 | `Mode: FK / IK` | Switch between FK and IK editing |
 
 ## 3D Controls
@@ -79,7 +82,7 @@ If you are updating from an older local copy, a full browser hard refresh is rec
 | --- | --- |
 | Left click | Select a joint or gizmo handle |
 | Left drag | Move the selected joint or drag in free space |
-| Right drag | Rotate the camera |
+| Right drag | Orbit the camera, or rotate the model in `Nav: Model` mode |
 | Middle drag | Pan the camera |
 | Mouse wheel | Zoom in or out |
 
@@ -91,6 +94,11 @@ If you are updating from an older local copy, a full browser hard refresh is rec
 | `Delete` / `Backspace` | Delete selected joints in 3D mode |
 | `Esc` | Clear selection |
 | `R` | Reset 3D view |
+| `.` / `Numpad .` | Frame the current 3D selection, or all points if nothing is selected |
+| `Home` | Frame all 3D points |
+| `Shift + .` | Set the camera pivot from the current selection |
+| `Shift + Home` | Set the camera pivot from the model center |
+| `Tab` | Toggle between orbit-camera mode and rotate-model mode |
 | `F` | Switch to FK mode |
 | `I` | Switch to IK mode |
 | `Ctrl + Z` | Undo |

@@ -123,6 +123,9 @@ const DEFAULT_KEYPOINTS = [
 ]
 
 const DEFAULT_THREE_CAMERA_STATE = { theta: 0, phi: Math.PI / 2, radius: 500 };
+const THREE_CAMERA_PHI_EPSILON = 0.05;
+const THREE_CAMERA_ORBIT_SPEED = 0.01;
+const THREE_FOCUS_PADDING = 1.35;
 const DEFAULT_BACKGROUND_TYPE = "input";
 const DEFAULT_BACKGROUND_OPACITY = 0.6;
 const DEFAULT_THREE_SCENE_BACKGROUND = 0x000000;
@@ -527,6 +530,8 @@ class OpenPosePanel {
     threeCameraState = { theta: 0, phi: Math.PI / 2, radius: 500 };
     threeTransformMode = 'translate';
     threeTransformCenter = null;
+    threeComputedModelCenter = null;
+    threeComputedSelectionCenter = null;
     threeIsTransforming = false;
     threeSelectionBox = null;
     threeControlPoints = null;
@@ -542,9 +547,14 @@ class OpenPosePanel {
     threeModelQuaternion = null;
     initial3DViewState = null;
     threeRigMode = "fk";
+    threeCameraNavigationMode = "camera_orbit";
+    threeCameraPivotMode = "model_center";
     showGizmo = true;
     showGizmoButton = null;
     resetViewButton = null;
+    frameSelectionButton = null;
+    navigationModeButton = null;
+    pivotModeButton = null;
     rigModeButton = null;
     statusTextEl = null;
     saveFilenameDialog = null;
@@ -1825,6 +1835,31 @@ class OpenPosePanel {
         });
         this.resetViewButton.title = "Restore the initial camera angle and zoom for the current pose";
 
+        this.frameSelectionButton = this.panel.addButton("Frame", () => {
+            if (this.is3DMode) {
+                this.focus3DSelection(true);
+            }
+        });
+        this.frameSelectionButton.title = "Frame the current selection, or all points if nothing is selected";
+
+        this.navigationModeButton = this.panel.addButton("Nav: Orbit", () => {
+            this.threeCameraNavigationMode = this.threeCameraNavigationMode === "camera_orbit"
+                ? "model_rotate_legacy"
+                : "camera_orbit";
+            this.updateNavigationModeButton();
+            this.update3DStatus();
+        });
+        this.navigationModeButton.title = "Switch between orbiting the camera and rotating the model";
+
+        this.pivotModeButton = this.panel.addButton("Pivot: Model", () => {
+            if (this.threeCameraPivotMode === "model_center") {
+                this.setCameraPivotFromSelectionCenter(true);
+            } else {
+                this.setCameraPivotFromModelCenter();
+            }
+        });
+        this.pivotModeButton.title = "Set the camera pivot from the model center or the current selection";
+
         this.rigModeButton = this.panel.addButton("Mode: FK", () => {
             this.threeRigMode = this.threeRigMode === "fk" ? "ik" : "fk";
             this.updateRigModeButton();
@@ -1903,6 +1938,8 @@ class OpenPosePanel {
         this.statusTextEl = document.createElement("div");
         this.statusTextEl.style.cssText = "min-width: 220px; color: #9ecbff; font-size: 11px; padding-left: 8px; white-space: nowrap;";
         this.mainToolbar.appendChild(this.statusTextEl);
+        this.updateNavigationModeButton();
+        this.updatePivotModeButton();
         this.updateRigModeButton();
         this.update3DStatus();
 
@@ -1987,12 +2024,7 @@ class OpenPosePanel {
         return [...this.threeSelectedObjects].filter(obj => obj?.userData?.pointData);
     }
 
-    getTransformTargetObjects() {
-        const selectedObjects = this.get3DSelectedPointObjects();
-        if (selectedObjects.length > 0) {
-            return selectedObjects;
-        }
-
+    getAll3DPointObjects() {
         const allObjects = [];
         this.threeObjects?.forEach((obj, key) => {
             if (key.startsWith("point_")) {
@@ -2000,6 +2032,15 @@ class OpenPosePanel {
             }
         });
         return allObjects;
+    }
+
+    getTransformTargetObjects() {
+        const selectedObjects = this.get3DSelectedPointObjects();
+        if (selectedObjects.length > 0) {
+            return selectedObjects;
+        }
+
+        return this.getAll3DPointObjects();
     }
 
     getTransformPivot() {
@@ -2015,6 +2056,86 @@ class OpenPosePanel {
 
         const THREE = window.THREE || globalThis.THREE;
         return new THREE.Vector3(center.x, center.y, center.z);
+    }
+
+    ensureThreeOrbitCenter() {
+        const THREE = window.THREE || globalThis.THREE;
+        if (!THREE) {
+            return null;
+        }
+
+        if (!this.threeOrbitCenter) {
+            const center = this.threeComputedModelCenter || this.getModelCenter();
+            this.threeOrbitCenter = center
+                ? new THREE.Vector3(center.x, center.y, center.z)
+                : new THREE.Vector3(0, 0, 0);
+        }
+
+        return this.threeOrbitCenter;
+    }
+
+    getComputedModelCenterVector() {
+        const THREE = window.THREE || globalThis.THREE;
+        if (!THREE) {
+            return null;
+        }
+
+        if (this.threeComputedModelCenter) {
+            return this.threeComputedModelCenter.clone();
+        }
+
+        const center = this.getModelCenter();
+        return center ? new THREE.Vector3(center.x, center.y, center.z) : null;
+    }
+
+    getComputedSelectionCenterVector() {
+        const THREE = window.THREE || globalThis.THREE;
+        if (!THREE) {
+            return null;
+        }
+
+        if (this.threeComputedSelectionCenter) {
+            return this.threeComputedSelectionCenter.clone();
+        }
+
+        if (this.threeTransformCenter) {
+            return this.threeTransformCenter.clone();
+        }
+
+        return null;
+    }
+
+    setCameraPivot(center, pivotMode = this.threeCameraPivotMode) {
+        const THREE = window.THREE || globalThis.THREE;
+        if (!THREE || !center) {
+            return false;
+        }
+
+        this.threeOrbitCenter = center.clone ? center.clone() : new THREE.Vector3(center.x, center.y, center.z);
+        this.threeCameraPivotMode = pivotMode;
+        this.updatePivotModeButton();
+        if (this.threeCamera) {
+            this.threeCamera.lookAt(this.threeOrbitCenter);
+            this.syncThreeCameraStateFromCamera();
+        }
+        this.update3DStatus();
+        return true;
+    }
+
+    setCameraPivotFromModelCenter() {
+        const center = this.getComputedModelCenterVector();
+        return this.setCameraPivot(center, "model_center");
+    }
+
+    setCameraPivotFromSelectionCenter(fallbackToModel = false) {
+        const selectionCenter = this.getComputedSelectionCenterVector();
+        if (selectionCenter) {
+            return this.setCameraPivot(selectionCenter, "selection_center");
+        }
+        if (fallbackToModel) {
+            return this.setCameraPivotFromModelCenter();
+        }
+        return false;
     }
 
     syncThreeCameraStateFromCamera() {
@@ -2139,6 +2260,22 @@ class OpenPosePanel {
         }
     }
 
+    updateNavigationModeButton() {
+        if (this.navigationModeButton) {
+            this.navigationModeButton.textContent = this.threeCameraNavigationMode === "camera_orbit"
+                ? "Nav: Orbit"
+                : "Nav: Model";
+        }
+    }
+
+    updatePivotModeButton() {
+        if (this.pivotModeButton) {
+            this.pivotModeButton.textContent = this.threeCameraPivotMode === "selection_center"
+                ? "Pivot: Selection"
+                : "Pivot: Model";
+        }
+    }
+
     update3DStatus() {
         if (!this.statusTextEl) {
             return;
@@ -2149,7 +2286,63 @@ class OpenPosePanel {
             ? (JOINT_NAMES[selectedObjects[0].userData.id] || `Joint ${selectedObjects[0].userData.id}`)
             : `${selectedObjects.length} selected`;
         const selectionText = selectedObjects.length > 0 ? selectedLabel : "No selection";
-        this.statusTextEl.textContent = `Mode: ${this.threeRigMode.toUpperCase()} | ${selectionText}`;
+        const navText = this.threeCameraNavigationMode === "camera_orbit" ? "Orbit" : "Model";
+        const pivotText = this.threeCameraPivotMode === "selection_center" ? "Selection" : "Model";
+        this.statusTextEl.textContent = `Rig: ${this.threeRigMode.toUpperCase()} | Nav: ${navText} | Pivot: ${pivotText} | ${selectionText}`;
+    }
+
+    focus3DObjects(objects) {
+        const THREE = window.THREE || globalThis.THREE;
+        const targetObjects = (objects || []).filter(obj => obj?.position);
+        if (!THREE || !this.threeCamera || targetObjects.length === 0) {
+            return false;
+        }
+
+        const bounds = new THREE.Box3();
+        targetObjects.forEach(obj => bounds.expandByPoint(obj.position));
+
+        const center = bounds.getCenter(new THREE.Vector3());
+        const size = bounds.getSize(new THREE.Vector3());
+        const radius = Math.max(size.length() * 0.5, 25);
+
+        const orbitCenter = this.ensureThreeOrbitCenter() || center.clone();
+        const viewDirection = this.threeCamera.position.clone().sub(orbitCenter);
+        if (viewDirection.lengthSq() < 0.000001) {
+            viewDirection.set(0, 0, 1);
+        }
+        viewDirection.normalize();
+
+        const verticalFov = (this.threeCamera.fov || 75) * Math.PI / 180;
+        const horizontalFov = 2 * Math.atan(Math.tan(verticalFov / 2) * (this.threeCamera.aspect || 1));
+        const distance = Math.max(
+            radius * THREE_FOCUS_PADDING / Math.tan(verticalFov / 2),
+            radius * THREE_FOCUS_PADDING / Math.tan(horizontalFov / 2),
+            80
+        );
+
+        this.threeOrbitCenter = center.clone();
+        this.threeCamera.position.copy(center.clone().add(viewDirection.multiplyScalar(distance)));
+        this.threeCamera.lookAt(this.threeOrbitCenter);
+        this.syncThreeCameraStateFromCamera();
+        this.updateTransformGizmo();
+        this.update3DSelectionBox();
+        this.update3DStatus();
+        return true;
+    }
+
+    focus3DSelection(fallbackToAll = false) {
+        const selectedObjects = this.get3DSelectedPointObjects();
+        if (selectedObjects.length > 0) {
+            return this.focus3DObjects(selectedObjects);
+        }
+        if (fallbackToAll) {
+            return this.focus3DAll();
+        }
+        return false;
+    }
+
+    focus3DAll() {
+        return this.focus3DObjects(this.getAll3DPointObjects());
     }
 
     promptForPoseFilename(defaultFilename) {
@@ -2466,6 +2659,39 @@ class OpenPosePanel {
         }
         else if (this.is3DMode && key === "r") {
             this.reset3DView();
+            e.preventDefault();
+            e.stopImmediatePropagation();
+        }
+        else if (this.is3DMode && e.shiftKey && e.code === "Period") {
+            if (this.setCameraPivotFromSelectionCenter(true)) {
+                e.preventDefault();
+                e.stopImmediatePropagation();
+            }
+        }
+        else if (this.is3DMode && e.shiftKey && key === "home") {
+            if (this.setCameraPivotFromModelCenter()) {
+                e.preventDefault();
+                e.stopImmediatePropagation();
+            }
+        }
+        else if (this.is3DMode && (key === "." || e.code === "NumpadDecimal")) {
+            if (this.focus3DSelection(true)) {
+                e.preventDefault();
+                e.stopImmediatePropagation();
+            }
+        }
+        else if (this.is3DMode && key === "home") {
+            if (this.focus3DAll()) {
+                e.preventDefault();
+                e.stopImmediatePropagation();
+            }
+        }
+        else if (this.is3DMode && key === "tab") {
+            this.threeCameraNavigationMode = this.threeCameraNavigationMode === "camera_orbit"
+                ? "model_rotate_legacy"
+                : "camera_orbit";
+            this.updateNavigationModeButton();
+            this.update3DStatus();
             e.preventDefault();
             e.stopImmediatePropagation();
         }
@@ -4354,104 +4580,81 @@ class OpenPosePanel {
         let isRotating = false;
         let mouseX = 0;
         let mouseY = 0;
-        let rotateCenter = null;
 
-
-        const getModelCenter = () => {
-            let centerX = 0, centerY = 0, centerZ = 0, count = 0;
-            this.threeObjects.forEach((obj, key) => {
-                if (key.startsWith('point_')) {
-                    centerX += obj.position.x;
-                    centerY += obj.position.y;
-                    centerZ += obj.position.z;
-                    count++;
-                }
-            });
-            if (count > 0) {
-                return new THREE.Vector3(centerX / count, centerY / count, centerZ / count);
+        const orbitCamera = (deltaX, deltaY) => {
+            const orbitCenter = this.ensureThreeOrbitCenter();
+            if (!orbitCenter) {
+                return;
             }
-            return new THREE.Vector3(0, 0, 0);
+
+            this.syncThreeCameraStateFromCamera();
+
+            const nextTheta = (this.threeCameraState?.theta ?? DEFAULT_THREE_CAMERA_STATE.theta) - (deltaX * THREE_CAMERA_ORBIT_SPEED);
+            const unclampedPhi = (this.threeCameraState?.phi ?? DEFAULT_THREE_CAMERA_STATE.phi) + (deltaY * THREE_CAMERA_ORBIT_SPEED);
+            const nextPhi = Math.max(THREE_CAMERA_PHI_EPSILON, Math.min(Math.PI - THREE_CAMERA_PHI_EPSILON, unclampedPhi));
+
+            this.threeCameraState = {
+                ...(this.threeCameraState || DEFAULT_THREE_CAMERA_STATE),
+                theta: nextTheta,
+                phi: nextPhi,
+            };
+            this.applyThreeCameraState(this.threeCameraState, orbitCenter);
         };
 
-
         const rotateModel = (deltaX, deltaY) => {
-            if (!rotateCenter) return;
-
-            const THREE = window.THREE;
-            const rotateSpeed = 0.01;
-
-
-
-            const angleX = deltaY * rotateSpeed;
-            const angleY = deltaX * rotateSpeed;
-
-
-            if (!this._tempDeltaQuaternion) {
-                this._tempDeltaQuaternion = new THREE.Quaternion();
+            const THREE = window.THREE || globalThis.THREE;
+            const rotateCenter = this.getComputedModelCenterVector();
+            if (!THREE || !rotateCenter) {
+                return;
             }
 
+            const angleX = deltaY * THREE_CAMERA_ORBIT_SPEED;
+            const angleY = deltaX * THREE_CAMERA_ORBIT_SPEED;
+            const deltaQuaternion = new THREE.Quaternion();
+
+            const applyRotation = (axisVector, angle) => {
+                if (!axisVector || Math.abs(angle) < 0.0001) {
+                    return;
+                }
+
+                deltaQuaternion.setFromAxisAngle(axisVector.clone().normalize(), angle);
+
+                this.threeObjects.forEach((obj, key) => {
+                    if (!key.startsWith('point_')) {
+                        return;
+                    }
+
+                    const relativePos = new THREE.Vector3().subVectors(obj.position, rotateCenter);
+                    relativePos.applyQuaternion(deltaQuaternion);
+                    obj.position.addVectors(rotateCenter, relativePos);
+
+                    if (obj.userData.pointData) {
+                        obj.userData.pointData.x = obj.position.x;
+                        obj.userData.pointData.y = obj.position.y;
+                        obj.userData.pointData.z = obj.position.z;
+                    }
+                });
+
+                if (!this.threeModelQuaternion) {
+                    this.threeModelQuaternion = new THREE.Quaternion();
+                }
+                this.threeModelQuaternion.premultiply(deltaQuaternion);
+            };
 
             if (Math.abs(deltaY) > 0.1) {
-                const axisX = this.getGizmoWorldAxis('x');
-                this._tempDeltaQuaternion.setFromAxisAngle(axisX, angleX);
-
-
-                this.threeObjects.forEach((obj, key) => {
-                    if (key.startsWith('point_')) {
-                        const relativePos = new THREE.Vector3().subVectors(obj.position, rotateCenter);
-                        relativePos.applyQuaternion(this._tempDeltaQuaternion);
-                        obj.position.addVectors(rotateCenter, relativePos);
-
-                        if (obj.userData.pointData) {
-                            obj.userData.pointData.x = obj.position.x;
-                            obj.userData.pointData.y = obj.position.y;
-                            obj.userData.pointData.z = obj.position.z;
-                        }
-                    }
-                });
-
-
-                if (!this.threeModelQuaternion) {
-                    this.threeModelQuaternion = new THREE.Quaternion();
-                }
-                this.threeModelQuaternion.premultiply(this._tempDeltaQuaternion);
+                applyRotation(this.getGizmoWorldAxis('x'), angleX);
             }
-
 
             if (Math.abs(deltaX) > 0.1) {
-                const axisY = this.getGizmoWorldAxis('y');
-                this._tempDeltaQuaternion.setFromAxisAngle(axisY, angleY);
-
-
-                this.threeObjects.forEach((obj, key) => {
-                    if (key.startsWith('point_')) {
-                        const relativePos = new THREE.Vector3().subVectors(obj.position, rotateCenter);
-                        relativePos.applyQuaternion(this._tempDeltaQuaternion);
-                        obj.position.addVectors(rotateCenter, relativePos);
-
-                        if (obj.userData.pointData) {
-                            obj.userData.pointData.x = obj.position.x;
-                            obj.userData.pointData.y = obj.position.y;
-                            obj.userData.pointData.z = obj.position.z;
-                        }
-                    }
-                });
-
-
-                if (!this.threeModelQuaternion) {
-                    this.threeModelQuaternion = new THREE.Quaternion();
-                }
-                this.threeModelQuaternion.premultiply(this._tempDeltaQuaternion);
+                applyRotation(this.getGizmoWorldAxis('y'), angleY);
             }
 
-
             this.updateAll3DLines();
-
-
+            this.update3DTransformCenter();
+            this.update3DOrbitCenter();
             this.updateTransformGizmo();
-
-
-            this.threeTransformCenter = rotateCenter.clone();
+            this.update3DSelectionBox();
+            this.update3DStatus();
         };
 
 
@@ -4460,8 +4663,7 @@ class OpenPosePanel {
                 isRotating = true;
                 mouseX = e.clientX;
                 mouseY = e.clientY;
-
-                rotateCenter = getModelCenter();
+                this.ensureThreeOrbitCenter();
                 e.preventDefault();
             }
         });
@@ -4485,8 +4687,11 @@ class OpenPosePanel {
                 const deltaX = e.clientX - mouseX;
                 const deltaY = e.clientY - mouseY;
 
-
-                rotateModel(deltaX, deltaY);
+                if (this.threeCameraNavigationMode === "model_rotate_legacy") {
+                    rotateModel(deltaX, deltaY);
+                } else {
+                    orbitCamera(deltaX, deltaY);
+                }
 
                 mouseX = e.clientX;
                 mouseY = e.clientY;
@@ -4496,7 +4701,9 @@ class OpenPosePanel {
 
 
                 const camera = this.threeCamera;
-                const panSpeed = 0.5;
+                const orbitCenter = this.ensureThreeOrbitCenter() || new THREE.Vector3(0, 0, 0);
+                const cameraDistance = camera.position.distanceTo(orbitCenter);
+                const panSpeed = Math.max(cameraDistance * 0.0012, 0.15);
 
 
                 const right = new THREE.Vector3(1, 0, 0).applyQuaternion(camera.quaternion);
@@ -4536,12 +4743,20 @@ class OpenPosePanel {
 
         this.threeRenderer.domElement.addEventListener('wheel', (e) => {
             e.preventDefault();
-            const zoomSpeed = 5;
+            const orbitCenter = this.ensureThreeOrbitCenter();
+            if (!orbitCenter) {
+                return;
+            }
 
-
-            const forward = new THREE.Vector3(0, 0, -1).applyQuaternion(this.threeCamera.quaternion);
-            this.threeCamera.position.add(forward.multiplyScalar(-e.deltaY * zoomSpeed * 0.1));
             this.syncThreeCameraStateFromCamera();
+
+            const currentRadius = this.threeCameraState?.radius ?? DEFAULT_THREE_CAMERA_STATE.radius;
+            const nextRadius = Math.max(40, Math.min(5000, currentRadius * Math.exp(e.deltaY * 0.001)));
+            this.threeCameraState = {
+                ...(this.threeCameraState || DEFAULT_THREE_CAMERA_STATE),
+                radius: nextRadius,
+            };
+            this.applyThreeCameraState(this.threeCameraState, orbitCenter);
         }, { passive: false });
 
 
@@ -4610,6 +4825,14 @@ class OpenPosePanel {
 
 
         this.updateTransformGizmo();
+        this.update3DOrbitCenter();
+        if (!this.threeOrbitCenter && this.threeComputedModelCenter) {
+            this.threeOrbitCenter = this.threeComputedModelCenter.clone();
+            if (this.threeCamera) {
+                this.threeCamera.lookAt(this.threeOrbitCenter);
+                this.syncThreeCameraStateFromCamera();
+            }
+        }
     }
 
 
@@ -5323,6 +5546,7 @@ class OpenPosePanel {
         });
         this.threeSelectedObjects.clear();
         this.threeTransformCenter = null;
+        this.threeComputedSelectionCenter = null;
 
         this.remove3DSelectionBox();
         this.updateTransformGizmo();
@@ -5333,6 +5557,7 @@ class OpenPosePanel {
     update3DTransformCenter() {
         if (this.threeSelectedObjects.size === 0) {
             this.threeTransformCenter = null;
+            this.threeComputedSelectionCenter = null;
             return;
         }
 
@@ -5349,6 +5574,7 @@ class OpenPosePanel {
             centerY / count,
             centerZ / count
         );
+        this.threeComputedSelectionCenter = this.threeTransformCenter.clone();
     }
 
 
@@ -5378,6 +5604,7 @@ class OpenPosePanel {
 
         if (this.threeTransformCenter) {
             this.threeTransformCenter.add(delta);
+            this.threeComputedSelectionCenter = this.threeTransformCenter.clone();
         }
 
         this.updateAll3DLines();
@@ -5498,7 +5725,7 @@ class OpenPosePanel {
 
 
         if (count > 0) {
-            this.threeOrbitCenter = new THREE.Vector3(
+            this.threeComputedModelCenter = new THREE.Vector3(
                 centerX / count,
                 centerY / count,
                 centerZ / count
@@ -5644,6 +5871,8 @@ class OpenPosePanel {
             else this.threeTransformCenter.z = (oppositeValue + newControlValue) / 2;
         }
 
+        this.threeComputedSelectionCenter = this.threeTransformCenter ? this.threeTransformCenter.clone() : null;
+
 
         this.updateAll3DLines();
 
@@ -5671,7 +5900,7 @@ class OpenPosePanel {
         });
 
         if (count > 0) {
-            this.threeOrbitCenter = new THREE.Vector3(centerX / count, centerY / count, centerZ / count);
+            this.threeComputedModelCenter = new THREE.Vector3(centerX / count, centerY / count, centerZ / count);
         }
     }
 
