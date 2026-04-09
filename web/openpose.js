@@ -123,6 +123,9 @@ const DEFAULT_KEYPOINTS = [
 ]
 
 const DEFAULT_THREE_CAMERA_STATE = { theta: 0, phi: Math.PI / 2, radius: 500 };
+const DEFAULT_BACKGROUND_TYPE = "input";
+const DEFAULT_BACKGROUND_OPACITY = 0.6;
+const DEFAULT_THREE_SCENE_BACKGROUND = 0x000000;
 
 const POSE_PARENT_MAP = {
     0: 1,
@@ -172,6 +175,217 @@ const JOINT_NAMES = {
     17: "Right Ear",
 };
 
+function normalizeBackgroundState(state) {
+    if (!state || typeof state !== "object") {
+        return null;
+    }
+
+    const rawFilename = typeof state.filename === "string" ? state.filename.trim() : "";
+    if (!rawFilename) {
+        return null;
+    }
+
+    const { filename: annotatedFilename, type: annotatedType } = extractAnnotatedBackgroundFilename(rawFilename);
+    let subfolder = typeof state.subfolder === "string" ? state.subfolder.trim() : "";
+    let filename = annotatedFilename;
+
+    if (!subfolder) {
+        const split = splitLegacyBackgroundPath(annotatedFilename);
+        filename = split.filename;
+        subfolder = split.subfolder;
+    }
+
+    if (!filename) {
+        return null;
+    }
+
+    const opacityValue = Number(state.opacity);
+
+    return {
+        filename,
+        subfolder,
+        type: typeof state.type === "string" && state.type.trim() ? state.type.trim() : annotatedType,
+        opacity: Number.isFinite(opacityValue) ? Math.min(1, Math.max(0, opacityValue)) : DEFAULT_BACKGROUND_OPACITY,
+    };
+}
+
+function extractAnnotatedBackgroundFilename(filename) {
+    const normalized = typeof filename === "string" ? filename.trim() : "";
+    if (!normalized) {
+        return { filename: "", type: DEFAULT_BACKGROUND_TYPE };
+    }
+
+    const suffixes = [
+        { suffix: "[output]", type: "output" },
+        { suffix: "[input]", type: "input" },
+        { suffix: "[temp]", type: "temp" },
+    ];
+
+    for (const { suffix, type } of suffixes) {
+        if (normalized.endsWith(suffix)) {
+            return {
+                filename: normalized.slice(0, -suffix.length).trim(),
+                type,
+            };
+        }
+    }
+
+    return { filename: normalized, type: DEFAULT_BACKGROUND_TYPE };
+}
+
+function splitLegacyBackgroundPath(filename) {
+    const normalized = typeof filename === "string" ? filename.trim() : "";
+    if (!normalized) {
+        return { filename: "", subfolder: "" };
+    }
+
+    if (/^[a-zA-Z]:[\\/]/.test(normalized) || normalized.startsWith("/") || normalized.startsWith("\\\\")) {
+        return { filename: normalized, subfolder: "" };
+    }
+
+    const slashNormalized = normalized.replace(/\\/g, "/");
+    const separatorIndex = slashNormalized.lastIndexOf("/");
+    if (separatorIndex <= 0) {
+        return { filename: slashNormalized, subfolder: "" };
+    }
+
+    return {
+        filename: slashNormalized.slice(separatorIndex + 1),
+        subfolder: slashNormalized.slice(0, separatorIndex),
+    };
+}
+
+function parseBackgroundState(rawValue) {
+    if (!rawValue) {
+        return null;
+    }
+
+    if (typeof rawValue === "object") {
+        return normalizeBackgroundState(rawValue);
+    }
+
+    if (typeof rawValue !== "string") {
+        return null;
+    }
+
+    const trimmed = rawValue.trim();
+    if (!trimmed) {
+        return null;
+    }
+
+    try {
+        const parsed = JSON.parse(trimmed);
+        if (parsed && typeof parsed === "object") {
+            return normalizeBackgroundState(parsed);
+        }
+    } catch (_) {
+    }
+
+    return normalizeBackgroundState({
+        filename: trimmed,
+        subfolder: "",
+        type: DEFAULT_BACKGROUND_TYPE,
+        opacity: DEFAULT_BACKGROUND_OPACITY,
+    });
+}
+
+function serializeBackgroundState(rawValueOrState) {
+    const normalized = normalizeBackgroundState(
+        typeof rawValueOrState === "string" ? parseBackgroundState(rawValueOrState) : rawValueOrState
+    );
+
+    if (!normalized) {
+        return "";
+    }
+
+    return JSON.stringify({
+        filename: normalized.filename,
+        subfolder: normalized.subfolder,
+        type: normalized.type,
+        opacity: normalized.opacity,
+    });
+}
+
+function buildBackgroundViewUrl(rawValueOrState, { cacheBust = true } = {}) {
+    const state = typeof rawValueOrState === "string"
+        ? parseBackgroundState(rawValueOrState)
+        : normalizeBackgroundState(rawValueOrState);
+
+    if (!state) {
+        return "";
+    }
+
+    const params = new URLSearchParams();
+    params.set("filename", state.filename);
+    params.set("type", state.type || DEFAULT_BACKGROUND_TYPE);
+    if (state.subfolder) {
+        params.set("subfolder", state.subfolder);
+    }
+    if (cacheBust) {
+        params.set("t", Date.now().toString());
+    }
+
+    return `/view?${params.toString()}`;
+}
+
+function setNodeBackgroundProperty(node, rawValueOrState) {
+    const serialized = typeof rawValueOrState === "string"
+        ? rawValueOrState
+        : serializeBackgroundState(rawValueOrState);
+
+    node.setProperty("backgroundImage", serialized);
+    if (node.bgImageWidget) {
+        node.bgImageWidget.value = serialized;
+    }
+
+    return serialized;
+}
+
+async function applyFabricBackgroundToCanvas(canvas, rawValueOrState) {
+    const state = typeof rawValueOrState === "string"
+        ? parseBackgroundState(rawValueOrState)
+        : normalizeBackgroundState(rawValueOrState);
+
+    if (!canvas) {
+        return null;
+    }
+
+    if (!state) {
+        return await new Promise((resolve) => {
+            canvas.setBackgroundImage(null, () => {
+                canvas.renderAll();
+                resolve(null);
+            });
+        });
+    }
+
+    const imageUrl = buildBackgroundViewUrl(state);
+    return await new Promise((resolve) => {
+        fabric.Image.fromURL(imageUrl, (img) => {
+            if (!img || !img.width || !img.height) {
+                canvas.setBackgroundImage(null, () => {
+                    canvas.renderAll();
+                    resolve(null);
+                });
+                return;
+            }
+
+            img.set({
+                scaleX: canvas.width / img.width,
+                scaleY: canvas.height / img.height,
+                opacity: state.opacity,
+                selectable: false,
+                evented: false,
+            });
+
+            canvas.setBackgroundImage(img, () => {
+                canvas.renderAll();
+                resolve(img);
+            });
+        }, { crossOrigin: 'anonymous' });
+    });
+}
+
 function clonePlainVector(vec, fallback = { x: 0, y: 0, z: 0 }) {
     if (!vec) {
         return { ...fallback };
@@ -209,6 +423,7 @@ async function loadImageAsync(imageURL) {
         const e = new Image();
         e.setAttribute('crossorigin', 'anonymous');
         e.addEventListener("load", () => { resolve(e); });
+        e.addEventListener("error", () => { resolve(null); });
         e.src = imageURL;
         return e;
     });
@@ -1366,6 +1581,9 @@ class OpenPosePanel {
 
         this.initialPoseData = null;
         this.initialBackgroundImage = null;
+        this.threeBackgroundTexture = null;
+        this.threeBackgroundCanvas = null;
+        this.threeBackgroundSyncToken = 0;
 
         this.panel.style.overflow = 'hidden';
         this.setPanelStyle();
@@ -1521,30 +1739,16 @@ class OpenPosePanel {
                 });
 
                 if (this.initialBackgroundImage) {
-                    this.node.setProperty("backgroundImage", this.initialBackgroundImage);
-
-                    const imageUrl = `/view?filename=${this.initialBackgroundImage}&type=input&t=${Date.now()}`;
-                    fabric.Image.fromURL(imageUrl, (img) => {
-                        if (!img || !img.width) return;
-                        img.set({
-                            scaleX: this.canvas.width / img.width,
-                            scaleY: this.canvas.height / img.height,
-                            opacity: 0.6,
-                            selectable: false,
-                            evented: false,
-                        });
-                        this.canvas.setBackgroundImage(img, this.canvas.renderAll.bind(this.canvas));
-                    }, { crossOrigin: 'anonymous' });
+                    void this.applyBackgroundState(this.initialBackgroundImage);
                 } else {
-                    this.canvas.setBackgroundImage(null, this.canvas.renderAll.bind(this.canvas));
-                    this.node.setProperty("backgroundImage", "");
+                    void this.clearBackgroundState();
                 }
 
                 this.syncDimensionsToNode();
             } else {
 
                 this.resetCanvas();
-                this.node.setProperty("backgroundImage", "");
+                void this.clearBackgroundState();
 
                 const default_pose_keypoints_2d = [];
                 DEFAULT_KEYPOINTS.forEach(pt => {
@@ -1601,13 +1805,7 @@ class OpenPosePanel {
 
 
         this.panel.addButton("Clear Background", () => {
-
-            this.canvas.setBackgroundImage(null, this.canvas.renderAll.bind(this.canvas));
-
-            this.node.setProperty("backgroundImage", "");
-            if (this.node.bgImageWidget) {
-                this.node.bgImageWidget.value = "";
-            }
+            void this.clearBackgroundState();
         });
 
 
@@ -1724,21 +1922,7 @@ class OpenPosePanel {
             if (bgImageFilename) {
 
                 this.initialBackgroundImage = bgImageFilename;
-
-                const imageUrl = `/view?filename=${bgImageFilename}&type=input&t=${Date.now()}`;
-                fabric.Image.fromURL(imageUrl, (img) => {
-                    if (!img || !img.width) {
-                        return;
-                    }
-                    img.set({
-                        scaleX: this.canvas.width / img.width,
-                        scaleY: this.canvas.height / img.height,
-                        opacity: 0.6,
-                        selectable: false,
-                        evented: false,
-                    });
-                    this.canvas.setBackgroundImage(img, this.canvas.renderAll.bind(this.canvas));
-                }, { crossOrigin: 'anonymous' });
+                await this.applyBackgroundState(bgImageFilename, { syncNode: false, sync3D: false });
             }
 
             if (this.node.properties.poses_datas && this.node.properties.poses_datas.trim() !== "") {
@@ -2516,6 +2700,10 @@ class OpenPosePanel {
             }
         }
 
+        if (this.node?.properties?.backgroundImage) {
+            void applyFabricBackgroundToCanvas(this.canvas, this.node.properties.backgroundImage);
+        }
+
         if (this.threeContainer && this.threeRenderer) {
             const threeRect = this.threeContainer.getBoundingClientRect();
             if (threeRect.width > 0 && threeRect.height > 0) {
@@ -2524,8 +2712,190 @@ class OpenPosePanel {
                     this.threeCamera.aspect = threeRect.width / threeRect.height;
                     this.threeCamera.updateProjectionMatrix();
                 }
+                void this.syncThreeSceneBackgroundFromNode();
             }
         }
+    }
+
+    getBackgroundState(rawValue = this.node?.properties?.backgroundImage) {
+        return parseBackgroundState(rawValue);
+    }
+
+    async applyBackgroundState(rawValueOrState, { syncNode = true, sync2D = true, sync3D = true } = {}) {
+        const serialized = typeof rawValueOrState === "string"
+            ? rawValueOrState
+            : serializeBackgroundState(rawValueOrState);
+
+        if (syncNode) {
+            setNodeBackgroundProperty(this.node, serialized);
+        }
+
+        if (sync2D) {
+            await applyFabricBackgroundToCanvas(this.canvas, serialized);
+        }
+
+        if (sync3D) {
+            await this.syncThreeSceneBackground(serialized);
+        }
+
+        return serialized;
+    }
+
+    async clearBackgroundState({ syncNode = true } = {}) {
+        return await this.applyBackgroundState("", { syncNode, sync2D: true, sync3D: true });
+    }
+
+    supportsSceneBackgroundTexture() {
+        return !!(this.threeScene && globalThis.THREE && globalThis.THREE.CanvasTexture);
+    }
+
+    clearThreeBackgroundFallback() {
+        if (this.threeContainer) {
+            this.threeContainer.style.backgroundImage = "";
+            this.threeContainer.style.backgroundSize = "";
+            this.threeContainer.style.backgroundRepeat = "";
+            this.threeContainer.style.backgroundPosition = "";
+            this.threeContainer.style.backgroundColor = "";
+            this.threeContainer.style.backgroundBlendMode = "";
+        }
+    }
+
+    syncThreeBackgroundFallback(state) {
+        if (!this.threeContainer) {
+            return;
+        }
+
+        this.disposeThreeBackgroundTexture();
+        if (this.threeScene) {
+            this.threeScene.background = null;
+        }
+        if (this.threeRenderer) {
+            this.threeRenderer.setClearColor(DEFAULT_THREE_SCENE_BACKGROUND, 0);
+        }
+
+        this.threeContainer.style.backgroundColor = "#000";
+        this.threeContainer.style.backgroundBlendMode = "normal";
+        this.threeContainer.style.backgroundImage = `url("${buildBackgroundViewUrl(state)}")`;
+        this.threeContainer.style.backgroundSize = "contain";
+        this.threeContainer.style.backgroundRepeat = "no-repeat";
+        this.threeContainer.style.backgroundPosition = "center";
+    }
+
+    disposeThreeBackgroundTexture() {
+        if (this.threeBackgroundTexture) {
+            this.threeBackgroundTexture.dispose();
+            this.threeBackgroundTexture = null;
+        }
+        this.threeBackgroundCanvas = null;
+    }
+
+    clearThreeSceneBackground() {
+        this.threeBackgroundSyncToken += 1;
+        this.disposeThreeBackgroundTexture();
+        this.clearThreeBackgroundFallback();
+
+        if (this.threeScene && globalThis.THREE) {
+            this.threeScene.background = new globalThis.THREE.Color(DEFAULT_THREE_SCENE_BACKGROUND);
+        }
+        if (this.threeRenderer) {
+            this.threeRenderer.setClearColor(DEFAULT_THREE_SCENE_BACKGROUND, 1);
+        }
+    }
+
+    composeThreeBackgroundCanvas(image, width, height, opacity = DEFAULT_BACKGROUND_OPACITY) {
+        if (!image || width <= 0 || height <= 0) {
+            return null;
+        }
+
+        const canvas = this.threeBackgroundCanvas || document.createElement("canvas");
+        canvas.width = width;
+        canvas.height = height;
+
+        const ctx = canvas.getContext("2d");
+        if (!ctx) {
+            return null;
+        }
+
+        ctx.clearRect(0, 0, width, height);
+        ctx.fillStyle = "#000";
+        ctx.fillRect(0, 0, width, height);
+
+        const scale = Math.min(width / image.width, height / image.height);
+        const drawWidth = image.width * scale;
+        const drawHeight = image.height * scale;
+        const offsetX = (width - drawWidth) / 2;
+        const offsetY = (height - drawHeight) / 2;
+
+        ctx.save();
+        ctx.globalAlpha = Number.isFinite(opacity) ? opacity : DEFAULT_BACKGROUND_OPACITY;
+        ctx.drawImage(image, offsetX, offsetY, drawWidth, drawHeight);
+        ctx.restore();
+
+        this.threeBackgroundCanvas = canvas;
+        return canvas;
+    }
+
+    async syncThreeSceneBackground(rawValueOrState = this.node?.properties?.backgroundImage) {
+        if (!this.threeScene) {
+            return;
+        }
+
+        const state = typeof rawValueOrState === "string"
+            ? parseBackgroundState(rawValueOrState)
+            : normalizeBackgroundState(rawValueOrState);
+
+        if (!state) {
+            this.clearThreeSceneBackground();
+            return;
+        }
+
+        if (!this.supportsSceneBackgroundTexture()) {
+            this.syncThreeBackgroundFallback(state);
+            return;
+        }
+
+        const targetWidth = Math.max(1, Math.round(this.threeContainer?.clientWidth || this.threeRenderer?.domElement?.width || this.canvasWidth || 1));
+        const targetHeight = Math.max(1, Math.round(this.threeContainer?.clientHeight || this.threeRenderer?.domElement?.height || this.canvasHeight || 1));
+        const syncToken = ++this.threeBackgroundSyncToken;
+        const image = await loadImageAsync(buildBackgroundViewUrl(state));
+
+        if (syncToken !== this.threeBackgroundSyncToken) {
+            return;
+        }
+
+        if (!image) {
+            this.clearThreeSceneBackground();
+            return;
+        }
+
+        const composedCanvas = this.composeThreeBackgroundCanvas(image, targetWidth, targetHeight, state.opacity);
+        if (!composedCanvas) {
+            this.syncThreeBackgroundFallback(state);
+            return;
+        }
+
+        this.disposeThreeBackgroundTexture();
+
+        const THREE = globalThis.THREE;
+        const texture = new THREE.CanvasTexture(composedCanvas);
+        if ("colorSpace" in texture && THREE.SRGBColorSpace) {
+            texture.colorSpace = THREE.SRGBColorSpace;
+        } else if ("encoding" in texture && THREE.sRGBEncoding) {
+            texture.encoding = THREE.sRGBEncoding;
+        }
+        texture.needsUpdate = true;
+
+        this.threeBackgroundTexture = texture;
+        this.threeBackgroundCanvas = composedCanvas;
+        this.clearThreeBackgroundFallback();
+        if (this.threeRenderer) {
+            this.threeRenderer.setClearColor(DEFAULT_THREE_SCENE_BACKGROUND, 1);
+        }
+        this.threeScene.background = texture;
+    }
+
+    async syncThreeSceneBackgroundFromNode() {
+        await this.syncThreeSceneBackground(this.node?.properties?.backgroundImage);
     }
 
     set2DCanvasInteractive(isInteractive) {
@@ -3498,27 +3868,15 @@ class OpenPosePanel {
                 throw new Error(`Failed to upload background image: ${resp.statusText}`);
             }
             const data = await resp.json();
-            const filename = data.name;
+            const backgroundState = normalizeBackgroundState({
+                filename: data.name,
+                subfolder: data.subfolder || "",
+                type: data.type || DEFAULT_BACKGROUND_TYPE,
+                opacity: DEFAULT_BACKGROUND_OPACITY,
+            });
 
-            this.node.setProperty("backgroundImage", filename);
-            if (this.node.bgImageWidget) {
-                this.node.bgImageWidget.value = filename;
-            }
-
-            const imageUrl = `/view?filename=${filename}&type=input&subfolder=${data.subfolder}&t=${Date.now()}`;
-            fabric.Image.fromURL(imageUrl, (img) => {
-                img.set({
-                    scaleX: this.canvas.width / img.width,
-                    scaleY: this.canvas.height / img.height,
-                    opacity: 0.6,
-                    selectable: false,
-                    evented: false,
-                });
-                this.canvas.setBackgroundImage(img, this.canvas.renderAll.bind(this.canvas));
-
-                this.uploadAndSetImages();
-
-            }, { crossOrigin: 'anonymous' });
+            await this.applyBackgroundState(backgroundState);
+            this.uploadAndSetImages();
 
         } catch (error) {
             alert(error);
@@ -3772,6 +4130,8 @@ class OpenPosePanel {
             this.initThreeJS();
         }
 
+        await this.syncThreeSceneBackgroundFromNode();
+
 
 
         let restoredFromJSON = false;
@@ -3935,7 +4295,7 @@ class OpenPosePanel {
 
 
         this.threeScene = new THREE.Scene();
-        this.threeScene.background = new THREE.Color(0x000000);
+        this.threeScene.background = new THREE.Color(DEFAULT_THREE_SCENE_BACKGROUND);
 
 
         const width = this.threeContainer.clientWidth;
@@ -3944,7 +4304,8 @@ class OpenPosePanel {
         this.threeCamera.position.z = 500;
 
 
-        this.threeRenderer = new THREE.WebGLRenderer({ antialias: true });
+        this.threeRenderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+        this.threeRenderer.setClearColor(DEFAULT_THREE_SCENE_BACKGROUND, 1);
 
         this.threeRenderer.setSize(width, height);
 
@@ -6357,24 +6718,11 @@ app.registerExtension({
                 }
             }
 
-
-            if (currentBackgroundImage && currentBackgroundImage.trim() !== "") {
-                node.setProperty("backgroundImage", currentBackgroundImage);
+            if (typeof currentBackgroundImage === "string") {
+                setNodeBackgroundProperty(node, currentBackgroundImage);
 
                 if (node.openPosePanel) {
-
-                    const imageUrl = `/view?filename=${currentBackgroundImage}&type=input&t=${Date.now()}`;
-                    fabric.Image.fromURL(imageUrl, (img) => {
-                        if (!img || !img.width) return;
-                        img.set({
-                            scaleX: node.openPosePanel.canvas.width / img.width,
-                            scaleY: node.openPosePanel.canvas.height / img.height,
-                            opacity: 0.6,
-                            selectable: false,
-                            evented: false,
-                        });
-                        node.openPosePanel.canvas.setBackgroundImage(img, node.openPosePanel.canvas.renderAll.bind(node.openPosePanel.canvas));
-                    }, { crossOrigin: 'anonymous' });
+                    void node.openPosePanel.applyBackgroundState(currentBackgroundImage, { syncNode: false });
                 }
             }
 
@@ -7160,49 +7508,27 @@ app.registerExtension({
 			}
 
 				if (message && message.backgroundImage && message.backgroundImage.length > 0) {
-					const bgImage = message.backgroundImage[0];
-					if (bgImage && bgImage.trim() !== "") {
-						this.setProperty("backgroundImage", bgImage);
-						if (this.bgImageWidget) {
-							this.bgImageWidget.value = bgImage;
-						}
-						dataUpdated = true;
-					}
+					const bgImage = typeof message.backgroundImage[0] === "string" ? message.backgroundImage[0] : "";
+					setNodeBackgroundProperty(this, bgImage);
+					dataUpdated = true;
 				}
 
 				if (message && message.inputPose && message.inputPose.length > 0) {
 					const bgImage = message.inputPose[0];
 					if (bgImage && bgImage.trim() !== "") {
-						this.setProperty("backgroundImage", bgImage);
-						if (this.bgImageWidget) {
-							this.bgImageWidget.value = bgImage;
-						}
+						setNodeBackgroundProperty(this, bgImage);
 						dataUpdated = true;
 					}
 				}
 
 			if (dataUpdated && this.openPosePanel) {
+				void (async () => {
+					if (this.properties.poses_datas && this.properties.poses_datas.trim() !== "") {
+						await this.openPosePanel.loadJSON(this.properties.poses_datas);
+					}
 
-				if (this.properties.poses_datas && this.properties.poses_datas.trim() !== "") {
-					void this.openPosePanel.loadJSON(this.properties.poses_datas);
-				}
-
-				if (this.properties.backgroundImage && this.properties.backgroundImage.trim() !== "") {
-					const imageUrl = `/view?filename=${this.properties.backgroundImage}&type=input&t=${Date.now()}`;
-					fabric.Image.fromURL(imageUrl, (img) => {
-						if (!img || !img.width) {
-							return;
-						}
-						img.set({
-							scaleX: this.openPosePanel.canvas.width / img.width,
-							scaleY: this.openPosePanel.canvas.height / img.height,
-							opacity: 0.6,
-							selectable: false,
-							evented: false,
-						});
-						this.openPosePanel.canvas.setBackgroundImage(img, this.openPosePanel.canvas.renderAll.bind(this.openPosePanel.canvas));
-					}, { crossOrigin: 'anonymous' });
-				}
+					await this.openPosePanel.applyBackgroundState(this.properties.backgroundImage, { syncNode: false });
+				})();
 			}
 
 			if (dataUpdated) {
@@ -7221,6 +7547,9 @@ app.registerExtension({
                 name = name.substring(folder_separator + 1);
             }
             const img = await loadImageAsync(`/view?filename=${name}&type=input&subfolder=${subfolder}&t=${Date.now()}`);
+            if (!img) {
+                return;
+            }
             this.imgs = [img];
             app.graph.setDirtyCanvas(true);
         }

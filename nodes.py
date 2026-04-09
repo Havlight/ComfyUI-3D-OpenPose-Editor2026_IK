@@ -67,6 +67,129 @@ POSE_3D_IMAGES = {}
 # 存储最新的姿态描述（按节点ID）
 POSTURE_DESCRIPTIONS = {}
 
+DEFAULT_BACKGROUND_OPACITY = 0.6
+
+
+def coerce_background_opacity(value):
+    try:
+        opacity = float(value)
+    except (TypeError, ValueError):
+        opacity = DEFAULT_BACKGROUND_OPACITY
+    return max(0.0, min(1.0, opacity))
+
+
+def extract_annotated_background_filename(filename):
+    normalized = str(filename or "").strip()
+    if not normalized:
+        return "", "input"
+
+    suffix_map = {
+        "[output]": "output",
+        "[input]": "input",
+        "[temp]": "temp",
+    }
+    for suffix, image_type in suffix_map.items():
+        if normalized.endswith(suffix):
+            return normalized[:-len(suffix)].rstrip(), image_type
+
+    return normalized, "input"
+
+
+def split_legacy_background_path(filename):
+    normalized = str(filename or "").strip()
+    if not normalized:
+        return "", ""
+
+    if os.path.isabs(normalized):
+        return normalized, ""
+
+    normalized = normalized.replace("\\", "/")
+    if "/" not in normalized:
+        return normalized, ""
+
+    subfolder, basename = normalized.rsplit("/", 1)
+    return basename, subfolder
+
+
+def parse_background_image_payload(raw_value):
+    if raw_value is None:
+        return None
+
+    if isinstance(raw_value, dict):
+        filename, inferred_type = extract_annotated_background_filename(raw_value.get("filename", ""))
+        if not filename:
+            return None
+        subfolder = str(raw_value.get("subfolder", "") or "").strip()
+        if not subfolder:
+            filename, subfolder = split_legacy_background_path(filename)
+        return {
+            "filename": filename,
+            "subfolder": subfolder,
+            "type": str(raw_value.get("type", inferred_type) or inferred_type).strip() or inferred_type,
+            "opacity": coerce_background_opacity(raw_value.get("opacity", DEFAULT_BACKGROUND_OPACITY)),
+        }
+
+    if isinstance(raw_value, str):
+        trimmed = raw_value.strip()
+        if not trimmed:
+            return None
+
+        try:
+            parsed = json.loads(trimmed)
+        except json.JSONDecodeError:
+            parsed = None
+
+        if isinstance(parsed, dict):
+            return parse_background_image_payload(parsed)
+
+        filename, inferred_type = extract_annotated_background_filename(trimmed)
+        filename, subfolder = split_legacy_background_path(filename)
+        return {
+            "filename": filename,
+            "subfolder": subfolder,
+            "type": inferred_type,
+            "opacity": DEFAULT_BACKGROUND_OPACITY,
+        }
+
+    return None
+
+
+def serialize_background_image_payload(filename, subfolder="", image_type="input", opacity=DEFAULT_BACKGROUND_OPACITY):
+    normalized_filename = str(filename or "").strip()
+    if not normalized_filename:
+        return ""
+
+    payload = {
+        "filename": normalized_filename,
+        "subfolder": str(subfolder or "").strip(),
+        "type": str(image_type or "input").strip() or "input",
+        "opacity": coerce_background_opacity(opacity if opacity is not None else DEFAULT_BACKGROUND_OPACITY),
+    }
+    return json.dumps(payload, ensure_ascii=False)
+
+
+def resolve_background_image_path(raw_value):
+    state = parse_background_image_payload(raw_value)
+    if not state:
+        return None, None
+
+    filename = state["filename"]
+    if os.path.isabs(filename):
+        return filename, state
+
+    image_type = state.get("type", "input")
+    if image_type == "output":
+        base_dir = folder_paths.get_output_directory()
+    elif image_type == "temp":
+        base_dir = folder_paths.get_temp_directory()
+    else:
+        base_dir = folder_paths.get_input_directory()
+
+    subfolder = state.get("subfolder", "")
+    if subfolder:
+        return os.path.join(base_dir, subfolder, filename), state
+    return os.path.join(base_dir, filename), state
+
 @routes.post('/openpose/save_3d_pose_image')
 async def openpose_save_3d_pose_image(request):
     try:
@@ -396,7 +519,8 @@ class OpenPoseEditor:
                 pass
             
         # 3. 保存prev_image为临时文件
-        ld_filepath= None
+        ld_filename = ""
+        input_pose_background = ""
         if prev_image is not None and prev_image.shape[0] > 0:
             try:
                 import time
@@ -406,7 +530,8 @@ class OpenPoseEditor:
                 ld_filename = f"openpose_ld_temp_{int(time.time() * 1000)}.png"
                 ld_filepath = os.path.join(temp_dir, ld_filename)
                 prev_image_pil.save(ld_filepath)
-                backgroundImage = ld_filename
+                input_pose_background = serialize_background_image_payload(ld_filename)
+                backgroundImage = input_pose_background
             except Exception as e:
                 pass
         
@@ -485,9 +610,9 @@ class OpenPoseEditor:
 
         # --- 输出2: DWPose+背景合成图 ---
         dw_combined_image = dw_pose_image.clone()
-        if backgroundImage and backgroundImage.strip() != "":
-            bg_image_path = folder_paths.get_annotated_filepath(backgroundImage)
-            if os.path.exists(bg_image_path):
+        if backgroundImage and str(backgroundImage).strip() != "":
+            bg_image_path, _background_state = resolve_background_image_path(backgroundImage)
+            if bg_image_path and os.path.exists(bg_image_path):
                 try:
                     bg_image_pil = Image.open(bg_image_path).convert("RGB")
                     bg_image_np = np.array(bg_image_pil)
@@ -556,7 +681,7 @@ class OpenPoseEditor:
         ui_data = {
             "poses_datas": [poses_datas],
             "editdPose": [dw_bg_filename],
-            "inputPose": [ld_filepath or ""],
+            "inputPose": [input_pose_background],
             "backgroundImage": [backgroundImage],
             "refresh_trigger": [f"{timestamp}_{random_str}"],
             "dw_pose_shape": [list(dw_pose_image.shape)],
