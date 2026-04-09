@@ -123,12 +123,29 @@ const DEFAULT_KEYPOINTS = [
 ]
 
 const DEFAULT_THREE_CAMERA_STATE = { theta: 0, phi: Math.PI / 2, radius: 500 };
+const DEFAULT_THREE_CAMERA_FOV = 75;
+const DEFAULT_THREE_CAMERA_PROJECTION = "perspective";
 const THREE_CAMERA_PHI_EPSILON = 0.05;
 const THREE_CAMERA_ORBIT_SPEED = 0.01;
 const THREE_FOCUS_PADDING = 1.35;
+const THREE_POSE_ANALYSIS_DEBOUNCE_MS = 120;
 const DEFAULT_BACKGROUND_TYPE = "input";
 const DEFAULT_BACKGROUND_OPACITY = 0.6;
 const DEFAULT_THREE_SCENE_BACKGROUND = 0x000000;
+const THREE_CAMERA_VIEW_PRESETS = {
+    front: { label: "Front", direction: [0, 0, 1] },
+    back: { label: "Back", direction: [0, 0, -1] },
+    left: { label: "Left", direction: [-1, 0, 0] },
+    right: { label: "Right", direction: [1, 0, 0] },
+    top: { label: "Top", direction: [0, 1, 0] },
+    bottom: { label: "Bottom", direction: [0, -1, 0] },
+};
+const OPENPOSE_LEFT_RIGHT_PAIRS = [
+    [2, 5], [3, 6], [4, 7],
+    [8, 11], [9, 12], [10, 13],
+    [14, 15], [16, 17],
+];
+const OPENPOSE_CENTERLINE_IDS = [0, 1];
 
 const POSE_PARENT_MAP = {
     0: 1,
@@ -548,19 +565,28 @@ class OpenPosePanel {
     initial3DViewState = null;
     threeRigMode = "fk";
     threeCameraNavigationMode = "camera_orbit";
+    threeCameraSpaceMode = "world";
     threeCameraPivotMode = "model_center";
+    threeTransformSpaceMode = "local";
+    threeCameraProjectionMode = DEFAULT_THREE_CAMERA_PROJECTION;
+    threeAnimationFrameHandle = null;
     showGizmo = true;
     showGizmoButton = null;
     resetViewButton = null;
     frameSelectionButton = null;
+    cameraSpaceModeButton = null;
+    transformSpaceModeButton = null;
     navigationModeButton = null;
     pivotModeButton = null;
+    projectionModeButton = null;
     rigModeButton = null;
     statusTextEl = null;
     saveFilenameDialog = null;
     poseDescriptionText = null;
     copyDescriptionBtn = null;
     poseDescriptionContainer = null;
+    poseDescriptionDirty = false;
+    poseDescriptionTimer = null;
 
 
     analyzePoseAndGenerateDescription() {
@@ -1808,6 +1834,24 @@ class OpenPosePanel {
             this.fixLimbs();
         });
 
+        this.panel.addButton("Mirror", () => {
+            if (this.is3DMode) {
+                this.mirror3DPose();
+            }
+        }).title = "Mirror the current 3D pose across the model local X axis";
+
+        this.panel.addButton("L→R", () => {
+            if (this.is3DMode) {
+                this.copy3DPoseSide("left_to_right");
+            }
+        }).title = "Copy the left side pose to the right side in 3D";
+
+        this.panel.addButton("R→L", () => {
+            if (this.is3DMode) {
+                this.copy3DPoseSide("right_to_left");
+            }
+        }).title = "Copy the right side pose to the left side in 3D";
+
         this.bgFileInput = container.querySelector(".openpose-bg-file-input");
         this.bgFileInput.style.display = "none";
         this.bgFileInput.addEventListener("change", (e) => this.loadBackgroundImage(e));
@@ -1841,6 +1885,36 @@ class OpenPosePanel {
             }
         });
         this.frameSelectionButton.title = "Frame the current selection, or all points if nothing is selected";
+
+        this.cameraSpaceModeButton = this.panel.addButton("Cam: World", () => {
+            this.setThreeCameraSpaceMode(
+                this.threeCameraSpaceMode === "world" ? "local" : "world"
+            );
+        });
+        this.cameraSpaceModeButton.title = "Switch camera orbit and view presets between world space and model local space";
+
+        this.transformSpaceModeButton = this.panel.addButton("Axes: Local", () => {
+            this.setThreeTransformSpaceMode(
+                this.threeTransformSpaceMode === "local" ? "world" : "local"
+            );
+        });
+        this.transformSpaceModeButton.title = "Switch gizmo axes and model-rotation axes between local and world space";
+
+        Object.entries(THREE_CAMERA_VIEW_PRESETS).forEach(([presetName, preset]) => {
+            const button = this.panel.addButton(preset.label, () => {
+                if (this.is3DMode) {
+                    this.apply3DViewPreset(presetName);
+                }
+            });
+            button.title = `Snap the 3D camera to the ${preset.label.toLowerCase()} view around the current pivot target`;
+        });
+
+        this.projectionModeButton = this.panel.addButton("Proj: Persp", () => {
+            this.setThreeCameraProjectionMode(
+                this.threeCameraProjectionMode === "perspective" ? "orthographic" : "perspective"
+            );
+        });
+        this.projectionModeButton.title = "Toggle between perspective and orthographic projection";
 
         this.navigationModeButton = this.panel.addButton("Nav: Orbit", () => {
             this.threeCameraNavigationMode = this.threeCameraNavigationMode === "camera_orbit"
@@ -1936,11 +2010,14 @@ class OpenPosePanel {
         this.mainToolbar.appendChild(this.poseFilterInput);
 
         this.statusTextEl = document.createElement("div");
-        this.statusTextEl.style.cssText = "min-width: 220px; color: #9ecbff; font-size: 11px; padding-left: 8px; white-space: nowrap;";
+        this.statusTextEl.style.cssText = "min-width: 320px; color: #9ecbff; font-size: 11px; padding-left: 8px; white-space: nowrap;";
         this.mainToolbar.appendChild(this.statusTextEl);
+        this.updateCameraSpaceModeButton();
+        this.updateTransformSpaceModeButton();
         this.updateNavigationModeButton();
         this.updatePivotModeButton();
         this.updateRigModeButton();
+        this.updateProjectionModeButton();
         this.update3DStatus();
 
         setTimeout(async () => {
@@ -2003,6 +2080,8 @@ class OpenPosePanel {
         document.addEventListener("keydown", keyHandler);
         this.panel.onClose = () => {
             document.removeEventListener("keydown", keyHandler);
+            this.stop3DAnimationLoop();
+            this.cancelPoseDescriptionRefresh();
             this.syncDimensionsToNode();
 
         };
@@ -2105,6 +2184,286 @@ class OpenPosePanel {
         return null;
     }
 
+    getModelBasisQuaternion() {
+        const THREE = window.THREE || globalThis.THREE;
+        if (!THREE) {
+            return null;
+        }
+
+        return this.threeModelQuaternion
+            ? this.threeModelQuaternion.clone()
+            : new THREE.Quaternion();
+    }
+
+    resolveCameraBasis() {
+        const THREE = window.THREE || globalThis.THREE;
+        if (!THREE) {
+            return null;
+        }
+
+        const quaternion = this.threeCameraSpaceMode === "local"
+            ? this.getModelBasisQuaternion()
+            : new THREE.Quaternion();
+        return {
+            quaternion,
+            right: new THREE.Vector3(1, 0, 0).applyQuaternion(quaternion),
+            up: new THREE.Vector3(0, 1, 0).applyQuaternion(quaternion),
+            forward: new THREE.Vector3(0, 0, 1).applyQuaternion(quaternion),
+        };
+    }
+
+    resolveTransformBasis() {
+        const THREE = window.THREE || globalThis.THREE;
+        if (!THREE) {
+            return null;
+        }
+
+        const quaternion = this.threeTransformSpaceMode === "local"
+            ? this.getModelBasisQuaternion()
+            : new THREE.Quaternion();
+        return {
+            quaternion,
+            right: new THREE.Vector3(1, 0, 0).applyQuaternion(quaternion),
+            up: new THREE.Vector3(0, 1, 0).applyQuaternion(quaternion),
+            forward: new THREE.Vector3(0, 0, 1).applyQuaternion(quaternion),
+        };
+    }
+
+    setThreeCameraSpaceMode(mode) {
+        if (mode !== "world" && mode !== "local") {
+            return false;
+        }
+
+        this.threeCameraSpaceMode = mode;
+        this.updateCameraSpaceModeButton();
+        this.update3DStatus();
+        return true;
+    }
+
+    setThreeTransformSpaceMode(mode) {
+        if (mode !== "world" && mode !== "local") {
+            return false;
+        }
+
+        this.threeTransformSpaceMode = mode;
+        this.updateTransformSpaceModeButton();
+        this.updateTransformGizmo();
+        this.update3DStatus();
+        return true;
+    }
+
+    getThreeCameraAspect() {
+        const width = Math.max(1, this.threeContainer?.clientWidth || this.threeRenderer?.domElement?.clientWidth || 1);
+        const height = Math.max(1, this.threeContainer?.clientHeight || this.threeRenderer?.domElement?.clientHeight || 1);
+        return width / height;
+    }
+
+    getThreeCameraFocusDistance(focusRadius = 25) {
+        const radius = Math.max(focusRadius, 25);
+        const aspect = this.getThreeCameraAspect();
+        const verticalFov = DEFAULT_THREE_CAMERA_FOV * Math.PI / 180;
+        const horizontalFov = 2 * Math.atan(Math.tan(verticalFov / 2) * aspect);
+        return Math.max(
+            radius * THREE_FOCUS_PADDING / Math.tan(verticalFov / 2),
+            radius * THREE_FOCUS_PADDING / Math.tan(horizontalFov / 2),
+            80
+        );
+    }
+
+    getThreeOrthographicHalfHeight(radius = this.threeCameraState?.radius ?? DEFAULT_THREE_CAMERA_STATE.radius) {
+        const safeRadius = Math.max(radius, 40);
+        return Math.max(safeRadius * Math.tan((DEFAULT_THREE_CAMERA_FOV * Math.PI / 180) / 2), 25);
+    }
+
+    updateThreeCameraProjectionMatrix(radius = this.threeCameraState?.radius ?? DEFAULT_THREE_CAMERA_STATE.radius) {
+        if (!this.threeCamera) {
+            return;
+        }
+
+        const aspect = this.getThreeCameraAspect();
+        if (this.threeCamera.isOrthographicCamera) {
+            const halfHeight = this.getThreeOrthographicHalfHeight(radius);
+            const halfWidth = halfHeight * aspect;
+            this.threeCamera.left = -halfWidth;
+            this.threeCamera.right = halfWidth;
+            this.threeCamera.top = halfHeight;
+            this.threeCamera.bottom = -halfHeight;
+        } else {
+            this.threeCamera.aspect = aspect;
+            this.threeCamera.fov = DEFAULT_THREE_CAMERA_FOV;
+        }
+
+        this.threeCamera.updateProjectionMatrix();
+    }
+
+    createThreeCameraForProjection(mode = this.threeCameraProjectionMode) {
+        const THREE = window.THREE || globalThis.THREE;
+        if (!THREE) {
+            return null;
+        }
+
+        const aspect = this.getThreeCameraAspect();
+        if (mode === "orthographic") {
+            const halfHeight = this.getThreeOrthographicHalfHeight();
+            const halfWidth = halfHeight * aspect;
+            return new THREE.OrthographicCamera(-halfWidth, halfWidth, halfHeight, -halfHeight, -5000, 5000);
+        }
+
+        return new THREE.PerspectiveCamera(DEFAULT_THREE_CAMERA_FOV, aspect, 0.1, 10000);
+    }
+
+    setThreeCameraProjectionMode(mode) {
+        if (mode !== "perspective" && mode !== "orthographic") {
+            return false;
+        }
+
+        if (mode === this.threeCameraProjectionMode && this.threeCamera) {
+            this.updateProjectionModeButton();
+            this.updateThreeCameraProjectionMatrix(this.threeCameraState?.radius ?? DEFAULT_THREE_CAMERA_STATE.radius);
+            this.update3DStatus();
+            return true;
+        }
+
+        this.threeCameraProjectionMode = mode;
+        this.updateProjectionModeButton();
+
+        const THREE = window.THREE || globalThis.THREE;
+        if (!THREE || !this.threeCamera) {
+            this.update3DStatus();
+            return true;
+        }
+
+        this.syncThreeCameraStateFromCamera();
+        const orbitCenter = this.ensureThreeOrbitCenter() || new THREE.Vector3(0, 0, 0);
+        const nextCamera = this.createThreeCameraForProjection(mode);
+        if (!nextCamera) {
+            return false;
+        }
+
+        nextCamera.position.copy(this.threeCamera.position);
+        nextCamera.up.copy(this.threeCamera.up);
+        this.threeCamera = nextCamera;
+        this.updateThreeCameraProjectionMatrix(this.threeCameraState?.radius ?? DEFAULT_THREE_CAMERA_STATE.radius);
+        this.threeCamera.lookAt(orbitCenter);
+        this.applyThreeCameraState(this.threeCameraState, orbitCenter);
+        this.schedulePoseDescriptionRefresh();
+        this.update3DStatus();
+        return true;
+    }
+
+    getViewPresetObjects() {
+        const selectedObjects = this.get3DSelectedPointObjects();
+        if (this.threeCameraPivotMode === "selection_center" && selectedObjects.length > 0) {
+            return selectedObjects;
+        }
+
+        return this.getAll3DPointObjects();
+    }
+
+    apply3DViewPreset(presetName) {
+        const THREE = window.THREE || globalThis.THREE;
+        const preset = THREE_CAMERA_VIEW_PRESETS[presetName];
+        if (!THREE || !this.threeCamera || !preset) {
+            return false;
+        }
+
+        const targetObjects = this.getViewPresetObjects();
+        if (targetObjects.length === 0) {
+            return false;
+        }
+
+        const bounds = new THREE.Box3();
+        targetObjects.forEach(obj => bounds.expandByPoint(obj.position));
+
+        const size = bounds.getSize(new THREE.Vector3());
+        const focusRadius = Math.max(size.length() * 0.5, 25);
+        const distance = this.getThreeCameraFocusDistance(focusRadius);
+        const orbitCenter = this.ensureThreeOrbitCenter() || bounds.getCenter(new THREE.Vector3());
+        const basis = this.resolveCameraBasis();
+        const direction = new THREE.Vector3(...preset.direction)
+            .applyQuaternion(basis?.quaternion || new THREE.Quaternion())
+            .normalize();
+
+        this.threeOrbitCenter = orbitCenter.clone();
+        this.threeCamera.position.copy(orbitCenter.clone().add(direction.multiplyScalar(distance)));
+        this.alignThreeCameraUp();
+        this.threeCamera.lookAt(orbitCenter);
+        this.threeCameraState = {
+            ...(this.threeCameraState || DEFAULT_THREE_CAMERA_STATE),
+            radius: distance,
+        };
+        this.syncThreeCameraStateFromCamera();
+        this.updateThreeCameraProjectionMatrix(this.threeCameraState.radius);
+        this.schedulePoseDescriptionRefresh();
+        this.update3DStatus();
+        return true;
+    }
+
+    schedulePoseDescriptionRefresh({ immediate = false, delay = THREE_POSE_ANALYSIS_DEBOUNCE_MS } = {}) {
+        if (!this.poseDescriptionText) {
+            return;
+        }
+
+        if (!this.is3DMode || !this.threeCamera || !this.threePoseData) {
+            this.poseDescriptionDirty = false;
+            if (this.poseDescriptionTimer) {
+                clearTimeout(this.poseDescriptionTimer);
+                this.poseDescriptionTimer = null;
+            }
+            this.poseDescriptionText.innerText = "Available in 3D mode";
+            return;
+        }
+
+        this.poseDescriptionDirty = true;
+
+        if (this.poseDescriptionTimer) {
+            clearTimeout(this.poseDescriptionTimer);
+            this.poseDescriptionTimer = null;
+        }
+
+        if (immediate) {
+            this.flushPoseDescriptionRefresh();
+            return;
+        }
+
+        this.poseDescriptionTimer = setTimeout(() => {
+            this.poseDescriptionTimer = null;
+            this.flushPoseDescriptionRefresh();
+        }, delay);
+    }
+
+    flushPoseDescriptionRefresh() {
+        if (!this.poseDescriptionDirty) {
+            return;
+        }
+
+        this.poseDescriptionDirty = false;
+        this.analyzePoseAndGenerateDescription();
+    }
+
+    cancelPoseDescriptionRefresh() {
+        this.poseDescriptionDirty = false;
+        if (this.poseDescriptionTimer) {
+            clearTimeout(this.poseDescriptionTimer);
+            this.poseDescriptionTimer = null;
+        }
+    }
+
+    start3DAnimationLoop() {
+        if (this.threeAnimationFrameHandle) {
+            return;
+        }
+
+        this.animate3D();
+    }
+
+    stop3DAnimationLoop() {
+        if (this.threeAnimationFrameHandle) {
+            cancelAnimationFrame(this.threeAnimationFrameHandle);
+            this.threeAnimationFrameHandle = null;
+        }
+    }
+
     setCameraPivot(center, pivotMode = this.threeCameraPivotMode) {
         const THREE = window.THREE || globalThis.THREE;
         if (!THREE || !center) {
@@ -2115,11 +2474,24 @@ class OpenPosePanel {
         this.threeCameraPivotMode = pivotMode;
         this.updatePivotModeButton();
         if (this.threeCamera) {
+            this.alignThreeCameraUp();
             this.threeCamera.lookAt(this.threeOrbitCenter);
             this.syncThreeCameraStateFromCamera();
+            this.schedulePoseDescriptionRefresh();
         }
         this.update3DStatus();
         return true;
+    }
+
+    alignThreeCameraUp() {
+        if (!this.threeCamera) {
+            return;
+        }
+
+        const basis = this.resolveCameraBasis();
+        if (basis?.up) {
+            this.threeCamera.up.copy(basis.up.clone().normalize());
+        }
     }
 
     setCameraPivotFromModelCenter() {
@@ -2169,8 +2541,55 @@ class OpenPosePanel {
         this.threeCamera.position.x = center.x + radius * Math.sin(phi) * Math.sin(theta);
         this.threeCamera.position.y = center.y + radius * Math.cos(phi);
         this.threeCamera.position.z = center.z + radius * Math.sin(phi) * Math.cos(theta);
+        this.alignThreeCameraUp();
         this.threeCamera.lookAt(center);
+        this.updateThreeCameraProjectionMatrix(radius);
         this.syncThreeCameraStateFromCamera();
+        this.schedulePoseDescriptionRefresh();
+    }
+
+    orbitThreeCamera(deltaX, deltaY, orbitCenter = this.ensureThreeOrbitCenter()) {
+        const THREE = window.THREE || globalThis.THREE;
+        if (!THREE || !this.threeCamera || !orbitCenter) {
+            return false;
+        }
+
+        const basis = this.resolveCameraBasis();
+        const upAxis = basis?.up?.clone?.().normalize?.() || new THREE.Vector3(0, 1, 0);
+        const offset = this.threeCamera.position.clone().sub(orbitCenter);
+        if (offset.lengthSq() < 0.000001) {
+            offset.set(0, 0, this.threeCameraState?.radius ?? DEFAULT_THREE_CAMERA_STATE.radius);
+        }
+
+        const yawAngle = -deltaX * THREE_CAMERA_ORBIT_SPEED;
+        const pitchAngle = deltaY * THREE_CAMERA_ORBIT_SPEED;
+
+        if (Math.abs(yawAngle) > 0.000001) {
+            const yawQuaternion = new THREE.Quaternion().setFromAxisAngle(upAxis, yawAngle);
+            offset.applyQuaternion(yawQuaternion);
+        }
+
+        if (Math.abs(pitchAngle) > 0.000001) {
+            const rightAxis = new THREE.Vector3().crossVectors(upAxis, offset).normalize();
+            if (rightAxis.lengthSq() > 0.000001) {
+                const pitchQuaternion = new THREE.Quaternion().setFromAxisAngle(rightAxis, pitchAngle);
+                const candidateOffset = offset.clone().applyQuaternion(pitchQuaternion);
+                const candidateDirection = candidateOffset.clone().normalize();
+                const dotToUp = candidateDirection.dot(upAxis);
+                const clamp = Math.cos(THREE_CAMERA_PHI_EPSILON);
+
+                if (Math.abs(dotToUp) < clamp) {
+                    offset.copy(candidateOffset);
+                }
+            }
+        }
+
+        this.threeCamera.position.copy(orbitCenter.clone().add(offset));
+        this.alignThreeCameraUp();
+        this.threeCamera.lookAt(orbitCenter);
+        this.syncThreeCameraStateFromCamera();
+        this.schedulePoseDescriptionRefresh();
+        return true;
     }
 
     captureCurrent3DViewState() {
@@ -2179,6 +2598,8 @@ class OpenPosePanel {
             camera_state: { ...(this.threeCameraState || DEFAULT_THREE_CAMERA_STATE) },
             camera_position: this.threeCamera ? clonePlainVector(this.threeCamera.position) : { x: 0, y: 0, z: 500 },
             orbit_center: clonePlainVector(this.threeOrbitCenter),
+            camera_space: this.threeCameraSpaceMode,
+            camera_projection: this.threeCameraProjectionMode,
             model_rotation: clonePlainQuaternion(this.threeModelQuaternion),
         };
     }
@@ -2245,6 +2666,8 @@ class OpenPosePanel {
             this.initial3DViewState.orbit_center.y,
             this.initial3DViewState.orbit_center.z
         );
+        this.setThreeCameraSpaceMode(this.initial3DViewState.camera_space || "world");
+        this.setThreeCameraProjectionMode(this.initial3DViewState.camera_projection || DEFAULT_THREE_CAMERA_PROJECTION);
         this.applyThreeCameraState(
             { ...this.initial3DViewState.camera_state },
             this.threeOrbitCenter
@@ -2268,11 +2691,35 @@ class OpenPosePanel {
         }
     }
 
+    updateCameraSpaceModeButton() {
+        if (this.cameraSpaceModeButton) {
+            this.cameraSpaceModeButton.textContent = this.threeCameraSpaceMode === "local"
+                ? "Cam: Local"
+                : "Cam: World";
+        }
+    }
+
+    updateTransformSpaceModeButton() {
+        if (this.transformSpaceModeButton) {
+            this.transformSpaceModeButton.textContent = this.threeTransformSpaceMode === "world"
+                ? "Axes: World"
+                : "Axes: Local";
+        }
+    }
+
     updatePivotModeButton() {
         if (this.pivotModeButton) {
             this.pivotModeButton.textContent = this.threeCameraPivotMode === "selection_center"
                 ? "Pivot: Selection"
                 : "Pivot: Model";
+        }
+    }
+
+    updateProjectionModeButton() {
+        if (this.projectionModeButton) {
+            this.projectionModeButton.textContent = this.threeCameraProjectionMode === "orthographic"
+                ? "Proj: Ortho"
+                : "Proj: Persp";
         }
     }
 
@@ -2287,8 +2734,11 @@ class OpenPosePanel {
             : `${selectedObjects.length} selected`;
         const selectionText = selectedObjects.length > 0 ? selectedLabel : "No selection";
         const navText = this.threeCameraNavigationMode === "camera_orbit" ? "Orbit" : "Model";
+        const cameraSpaceText = this.threeCameraSpaceMode === "local" ? "Local" : "World";
+        const axesText = this.threeTransformSpaceMode === "world" ? "World" : "Local";
         const pivotText = this.threeCameraPivotMode === "selection_center" ? "Selection" : "Model";
-        this.statusTextEl.textContent = `Rig: ${this.threeRigMode.toUpperCase()} | Nav: ${navText} | Pivot: ${pivotText} | ${selectionText}`;
+        const projectionText = this.threeCameraProjectionMode === "orthographic" ? "Ortho" : "Persp";
+        this.statusTextEl.textContent = `Rig: ${this.threeRigMode.toUpperCase()} | Nav: ${navText} | Cam: ${cameraSpaceText} | Axes: ${axesText} | Pivot: ${pivotText} | Proj: ${projectionText} | ${selectionText}`;
     }
 
     focus3DObjects(objects) {
@@ -2312,18 +2762,15 @@ class OpenPosePanel {
         }
         viewDirection.normalize();
 
-        const verticalFov = (this.threeCamera.fov || 75) * Math.PI / 180;
-        const horizontalFov = 2 * Math.atan(Math.tan(verticalFov / 2) * (this.threeCamera.aspect || 1));
-        const distance = Math.max(
-            radius * THREE_FOCUS_PADDING / Math.tan(verticalFov / 2),
-            radius * THREE_FOCUS_PADDING / Math.tan(horizontalFov / 2),
-            80
-        );
+        const distance = this.getThreeCameraFocusDistance(radius);
 
         this.threeOrbitCenter = center.clone();
         this.threeCamera.position.copy(center.clone().add(viewDirection.multiplyScalar(distance)));
+        this.alignThreeCameraUp();
         this.threeCamera.lookAt(this.threeOrbitCenter);
         this.syncThreeCameraStateFromCamera();
+        this.updateThreeCameraProjectionMatrix(this.threeCameraState?.radius ?? distance);
+        this.schedulePoseDescriptionRefresh();
         this.updateTransformGizmo();
         this.update3DSelectionBox();
         this.update3DStatus();
@@ -2343,6 +2790,281 @@ class OpenPosePanel {
 
     focus3DAll() {
         return this.focus3DObjects(this.getAll3DPointObjects());
+    }
+
+    get3DCommandPoseIds() {
+        if (!this.threePoseData?.points?.length) {
+            return [];
+        }
+
+        const selectedPoseIds = new Set(
+            this.get3DSelectedPointObjects()
+                .map(obj => obj?.userData?.poseId)
+                .filter(poseId => poseId != null)
+        );
+        if (selectedPoseIds.size > 0) {
+            return [...selectedPoseIds];
+        }
+
+        return [...new Set(this.threePoseData.points.map(point => point.poseId))];
+    }
+
+    get3DModelLocalContext() {
+        const THREE = window.THREE || globalThis.THREE;
+        if (!THREE) {
+            return null;
+        }
+
+        const modelCenter = this.getComputedModelCenterVector() || new THREE.Vector3(0, 0, 0);
+        const modelQuaternion = this.getModelBasisQuaternion() || new THREE.Quaternion();
+        const inverseQuaternion = modelQuaternion.clone().invert();
+        return {
+            modelCenter,
+            modelQuaternion,
+            inverseQuaternion,
+        };
+    }
+
+    worldPointToModelLocal(position, context = this.get3DModelLocalContext()) {
+        const THREE = window.THREE || globalThis.THREE;
+        if (!THREE || !context || !position) {
+            return null;
+        }
+
+        return position.clone()
+            .sub(context.modelCenter)
+            .applyQuaternion(context.inverseQuaternion)
+            .add(context.modelCenter);
+    }
+
+    modelLocalPointToWorld(position, context = this.get3DModelLocalContext()) {
+        const THREE = window.THREE || globalThis.THREE;
+        if (!THREE || !context || !position) {
+            return null;
+        }
+
+        return position.clone()
+            .sub(context.modelCenter)
+            .applyQuaternion(context.modelQuaternion)
+            .add(context.modelCenter);
+    }
+
+    getOrCreate3DPosePoint(pointMap, poseId, jointId) {
+        let point = pointMap.get(jointId);
+        if (point) {
+            return point;
+        }
+
+        point = {
+            id: jointId,
+            poseId,
+            x: 0,
+            y: 0,
+            z: 0,
+            color: connect_color[jointId] || [255, 255, 255],
+        };
+        this.threePoseData.points.push(point);
+        pointMap.set(jointId, point);
+        return point;
+    }
+
+    ensure3DPoseConnections() {
+        if (!this.threePoseData) {
+            return;
+        }
+
+        const pointMapByPose = new Map();
+        this.threePoseData.points.forEach(point => {
+            if (!pointMapByPose.has(point.poseId)) {
+                pointMapByPose.set(point.poseId, new Set());
+            }
+            pointMapByPose.get(point.poseId).add(point.id);
+        });
+
+        const connectionKeys = new Set(
+            this.threePoseData.connections.map(conn => `${conn.startId}_${conn.endId}_${conn.startPoseId}_${conn.endPoseId}`)
+        );
+
+        pointMapByPose.forEach((ids, poseId) => {
+            connect_keypoints.forEach(([startId, endId]) => {
+                if (!ids.has(startId) || !ids.has(endId)) {
+                    return;
+                }
+                const key = `${startId}_${endId}_${poseId}_${poseId}`;
+                if (connectionKeys.has(key)) {
+                    return;
+                }
+                connectionKeys.add(key);
+                this.threePoseData.connections.push({
+                    startId,
+                    endId,
+                    startPoseId: poseId,
+                    endPoseId: poseId,
+                });
+            });
+        });
+    }
+
+    commit3DPoseCommand() {
+        this.ensure3DPoseConnections();
+        this.render3DPose();
+        this.update3DStatus();
+        this.schedulePoseDescriptionRefresh({ immediate: true });
+    }
+
+    mirror3DPose() {
+        if (!this.threePoseData?.points?.length) {
+            return false;
+        }
+
+        const THREE = window.THREE || globalThis.THREE;
+        const context = this.get3DModelLocalContext();
+        if (!THREE || !context) {
+            return false;
+        }
+
+        const targetPoseIds = new Set(this.get3DCommandPoseIds());
+        if (targetPoseIds.size === 0) {
+            return false;
+        }
+
+        const pairJointIds = new Set(OPENPOSE_LEFT_RIGHT_PAIRS.flat());
+        targetPoseIds.forEach(poseId => {
+            const posePoints = this.threePoseData.points.filter(point => point.poseId === poseId);
+            if (posePoints.length === 0) {
+                return;
+            }
+
+            const pointMap = new Map(posePoints.map(point => [point.id, point]));
+            const localSnapshot = new Map();
+            posePoints.forEach(point => {
+                const world = new THREE.Vector3(point.x, point.y, point.z);
+                localSnapshot.set(point.id, this.worldPointToModelLocal(world, context));
+            });
+
+            const poseCenter = new THREE.Vector3();
+            posePoints.forEach(point => poseCenter.add(localSnapshot.get(point.id)));
+            poseCenter.multiplyScalar(1 / posePoints.length);
+
+            const reflectLocalPoint = (localPoint) => new THREE.Vector3(
+                (poseCenter.x * 2) - localPoint.x,
+                localPoint.y,
+                localPoint.z
+            );
+
+            OPENPOSE_LEFT_RIGHT_PAIRS.forEach(([leftId, rightId]) => {
+                const leftLocal = localSnapshot.get(leftId);
+                const rightLocal = localSnapshot.get(rightId);
+                if (!leftLocal && !rightLocal) {
+                    return;
+                }
+
+                if (rightLocal) {
+                    const leftPoint = this.getOrCreate3DPosePoint(pointMap, poseId, leftId);
+                    const mirrored = this.modelLocalPointToWorld(reflectLocalPoint(rightLocal), context);
+                    leftPoint.x = mirrored.x;
+                    leftPoint.y = mirrored.y;
+                    leftPoint.z = mirrored.z;
+                }
+
+                if (leftLocal) {
+                    const rightPoint = this.getOrCreate3DPosePoint(pointMap, poseId, rightId);
+                    const mirrored = this.modelLocalPointToWorld(reflectLocalPoint(leftLocal), context);
+                    rightPoint.x = mirrored.x;
+                    rightPoint.y = mirrored.y;
+                    rightPoint.z = mirrored.z;
+                }
+            });
+
+            OPENPOSE_CENTERLINE_IDS.forEach(jointId => {
+                const localPoint = localSnapshot.get(jointId);
+                if (!localPoint) {
+                    return;
+                }
+                const point = pointMap.get(jointId);
+                const mirrored = this.modelLocalPointToWorld(reflectLocalPoint(localPoint), context);
+                point.x = mirrored.x;
+                point.y = mirrored.y;
+                point.z = mirrored.z;
+            });
+
+            posePoints.forEach(point => {
+                if (pairJointIds.has(point.id) || OPENPOSE_CENTERLINE_IDS.includes(point.id)) {
+                    return;
+                }
+                const localPoint = localSnapshot.get(point.id);
+                if (!localPoint) {
+                    return;
+                }
+                const mirrored = this.modelLocalPointToWorld(reflectLocalPoint(localPoint), context);
+                point.x = mirrored.x;
+                point.y = mirrored.y;
+                point.z = mirrored.z;
+            });
+        });
+
+        this.commit3DPoseCommand();
+        return true;
+    }
+
+    copy3DPoseSide(direction = "left_to_right") {
+        if (!this.threePoseData?.points?.length) {
+            return false;
+        }
+
+        const THREE = window.THREE || globalThis.THREE;
+        const context = this.get3DModelLocalContext();
+        if (!THREE || !context) {
+            return false;
+        }
+
+        const targetPoseIds = new Set(this.get3DCommandPoseIds());
+        if (targetPoseIds.size === 0) {
+            return false;
+        }
+
+        const isLeftToRight = direction === "left_to_right";
+        targetPoseIds.forEach(poseId => {
+            const posePoints = this.threePoseData.points.filter(point => point.poseId === poseId);
+            if (posePoints.length === 0) {
+                return;
+            }
+
+            const pointMap = new Map(posePoints.map(point => [point.id, point]));
+            const localSnapshot = new Map();
+            posePoints.forEach(point => {
+                const world = new THREE.Vector3(point.x, point.y, point.z);
+                localSnapshot.set(point.id, this.worldPointToModelLocal(world, context));
+            });
+
+            const poseCenter = new THREE.Vector3();
+            posePoints.forEach(point => poseCenter.add(localSnapshot.get(point.id)));
+            poseCenter.multiplyScalar(1 / posePoints.length);
+
+            const reflectLocalPoint = (localPoint) => new THREE.Vector3(
+                (poseCenter.x * 2) - localPoint.x,
+                localPoint.y,
+                localPoint.z
+            );
+
+            OPENPOSE_LEFT_RIGHT_PAIRS.forEach(([leftId, rightId]) => {
+                const sourceId = isLeftToRight ? leftId : rightId;
+                const targetId = isLeftToRight ? rightId : leftId;
+                const sourceLocal = localSnapshot.get(sourceId);
+                if (!sourceLocal) {
+                    return;
+                }
+
+                const targetPoint = this.getOrCreate3DPosePoint(pointMap, poseId, targetId);
+                const mirrored = this.modelLocalPointToWorld(reflectLocalPoint(sourceLocal), context);
+                targetPoint.x = mirrored.x;
+                targetPoint.y = mirrored.y;
+                targetPoint.z = mirrored.z;
+            });
+        });
+
+        this.commit3DPoseCommand();
+        return true;
     }
 
     promptForPoseFilename(defaultFilename) {
@@ -2518,6 +3240,15 @@ class OpenPosePanel {
         return jointId != null ? TWO_BONE_IK_CHAINS[jointId] || null : null;
     }
 
+    findIKChainForMidObject(obj) {
+        const jointId = obj?.userData?.id;
+        if (jointId == null) {
+            return null;
+        }
+
+        return Object.values(TWO_BONE_IK_CHAINS).find(chain => chain.mid === jointId) || null;
+    }
+
     solveTwoBoneIKForTarget(obj, targetPosition) {
         const chain = this.findIKChainForObject(obj);
         const poseId = obj?.userData?.poseId;
@@ -2589,6 +3320,75 @@ class OpenPosePanel {
         endData.x = endTarget.x;
         endData.y = endTarget.y;
         endData.z = endTarget.z;
+
+        this.updateAll3DLines();
+        this.update3DTransformCenter();
+        this.updateTransformGizmo();
+        this.update3DSelectionBox();
+        this.update3DOrbitCenter();
+        this.update3DStatus();
+        return true;
+    }
+
+    solveTwoBoneIKForMidTarget(obj, targetPosition) {
+        const chain = this.findIKChainForMidObject(obj);
+        const poseId = obj?.userData?.poseId;
+        const THREE = window.THREE || globalThis.THREE;
+        if (!chain || poseId == null || !targetPosition || !THREE) {
+            return false;
+        }
+
+        const rootData = this.getThreePointDataByIds(chain.root, poseId);
+        const midData = this.getThreePointDataByIds(chain.mid, poseId);
+        const endData = this.getThreePointDataByIds(chain.end, poseId);
+        const rootObj = this.getThreePointObjectByIds(chain.root, poseId);
+        const midObj = this.getThreePointObjectByIds(chain.mid, poseId);
+        const endObj = this.getThreePointObjectByIds(chain.end, poseId);
+
+        if (!rootData || !midData || !endData || !rootObj || !midObj || !endObj) {
+            return false;
+        }
+
+        const rootPos = rootObj.position.clone();
+        const midPos = midObj.position.clone();
+        const endPos = endObj.position.clone();
+
+        const lengthA = rootPos.distanceTo(midPos);
+        const lengthB = midPos.distanceTo(endPos);
+        if (lengthA < 0.001 || lengthB < 0.001) {
+            return false;
+        }
+
+        let rootToMid = targetPosition.clone().sub(rootPos);
+        if (rootToMid.lengthSq() < 0.000001) {
+            rootToMid = midPos.clone().sub(rootPos);
+        }
+        if (rootToMid.lengthSq() < 0.000001) {
+            rootToMid = new THREE.Vector3(1, 0, 0);
+        }
+        rootToMid.normalize();
+
+        const newMid = rootPos.clone().addScaledVector(rootToMid, lengthA);
+        let newEndDirection = endPos.clone().sub(newMid);
+        if (newEndDirection.lengthSq() < 0.000001) {
+            newEndDirection = endPos.clone().sub(midPos);
+        }
+        if (newEndDirection.lengthSq() < 0.000001) {
+            newEndDirection = this.threeCamera?.getWorldDirection(new THREE.Vector3()) || new THREE.Vector3(0, 0, 1);
+        }
+        newEndDirection.normalize();
+
+        const newEnd = newMid.clone().addScaledVector(newEndDirection, lengthB);
+
+        midObj.position.copy(newMid);
+        endObj.position.copy(newEnd);
+
+        midData.x = newMid.x;
+        midData.y = newMid.y;
+        midData.z = newMid.z;
+        endData.x = newEnd.x;
+        endData.y = newEnd.y;
+        endData.z = newEnd.z;
 
         this.updateAll3DLines();
         this.update3DTransformCenter();
@@ -2935,8 +3735,7 @@ class OpenPosePanel {
             if (threeRect.width > 0 && threeRect.height > 0) {
                 this.threeRenderer.setSize(threeRect.width, threeRect.height);
                 if (this.threeCamera) {
-                    this.threeCamera.aspect = threeRect.width / threeRect.height;
-                    this.threeCamera.updateProjectionMatrix();
+                    this.updateThreeCameraProjectionMatrix(this.threeCameraState?.radius ?? DEFAULT_THREE_CAMERA_STATE.radius);
                 }
                 void this.syncThreeSceneBackgroundFromNode();
             }
@@ -3574,8 +4373,10 @@ class OpenPosePanel {
 
 
     saveToNode() {
-
-        this.analyzePoseAndGenerateDescription();
+        this.flushPoseDescriptionRefresh();
+        if (!this.is3DMode) {
+            this.analyzePoseAndGenerateDescription();
+        }
 
 
         let latestDescription = "";
@@ -3705,7 +4506,9 @@ class OpenPosePanel {
                 "camera_state": this.threeCameraState,
                 "model_rotation": modelRotation,
                 "orbit_center": orbitCenter,
-                "version": "1.2"
+                "camera_space": this.threeCameraSpaceMode,
+                "camera_projection": this.threeCameraProjectionMode,
+                "version": "1.4"
             }
         };
 
@@ -4201,6 +5004,22 @@ class OpenPosePanel {
                     console.log('[OpenPose] Restored camera state:', this.threeCameraState);
                 }
 
+                if (json["_3d_pose_data"].camera_space) {
+                    this.threeCameraSpaceMode = json["_3d_pose_data"].camera_space === "local"
+                        ? "local"
+                        : "world";
+                } else {
+                    this.threeCameraSpaceMode = "world";
+                }
+
+                if (json["_3d_pose_data"].camera_projection) {
+                    this.threeCameraProjectionMode = json["_3d_pose_data"].camera_projection === "orthographic"
+                        ? "orthographic"
+                        : DEFAULT_THREE_CAMERA_PROJECTION;
+                } else {
+                    this.threeCameraProjectionMode = DEFAULT_THREE_CAMERA_PROJECTION;
+                }
+
                 if (json["_3d_pose_data"].model_rotation) {
                     const rot = json["_3d_pose_data"].model_rotation;
                     if (!this.threeModelQuaternion) {
@@ -4218,6 +5037,8 @@ class OpenPosePanel {
             } else {
                 this.threePoseData = null;
                 this.threeCameraState = { ...DEFAULT_THREE_CAMERA_STATE };
+                this.threeCameraSpaceMode = "world";
+                this.threeCameraProjectionMode = DEFAULT_THREE_CAMERA_PROJECTION;
                 if (globalThis.THREE) {
                     this.threeModelQuaternion = new globalThis.THREE.Quaternion();
                     this.threeOrbitCenter = new globalThis.THREE.Vector3(0, 0, 0);
@@ -4226,6 +5047,10 @@ class OpenPosePanel {
                     this.threeOrbitCenter = null;
                 }
             }
+
+            this.updateCameraSpaceModeButton();
+            this.updateTransformSpaceModeButton();
+            this.updateProjectionModeButton();
 
 
             this.rotationX = 0;
@@ -4248,6 +5073,8 @@ class OpenPosePanel {
                     this.threeOrbitCenter = new globalThis.THREE.Vector3(0, 0, 0);
                 }
 
+                this.setThreeCameraSpaceMode(this.threeCameraSpaceMode || "world");
+                this.setThreeCameraProjectionMode(this.threeCameraProjectionMode || DEFAULT_THREE_CAMERA_PROJECTION);
                 if (this.threeCamera && this.threeCameraState) {
                     this.applyThreeCameraState(this.threeCameraState, this.threeOrbitCenter);
                 }
@@ -4398,6 +5225,8 @@ class OpenPosePanel {
 
 
         const poseDataStr = this.node.properties.poses_datas;
+        let restoredCameraSpaceMode = null;
+        let restoredProjectionMode = null;
         if (poseDataStr && typeof poseDataStr === 'string') {
             try {
                 const poseData = JSON.parse(poseDataStr);
@@ -4423,24 +5252,30 @@ class OpenPosePanel {
                         this.threeOrbitCenter = new THREE.Vector3(oc.x, oc.y, oc.z);
                         console.log('[OpenPose] Restored orbit center from JSON:', oc);
                     }
+
+                    if (poseData["_3d_pose_data"].camera_space) {
+                        restoredCameraSpaceMode = poseData["_3d_pose_data"].camera_space === "local"
+                            ? "local"
+                            : "world";
+                    }
+
+                    if (poseData["_3d_pose_data"].camera_projection) {
+                        restoredProjectionMode = poseData["_3d_pose_data"].camera_projection === "orthographic"
+                            ? "orthographic"
+                            : DEFAULT_THREE_CAMERA_PROJECTION;
+                    }
                 }
             } catch (e) {
                 console.log('[OpenPose] Failed to restore 3D state from JSON:', e);
             }
         }
 
+        this.setThreeCameraSpaceMode(restoredCameraSpaceMode || this.threeCameraSpaceMode || "world");
+        this.setThreeCameraProjectionMode(restoredProjectionMode || this.threeCameraProjectionMode || DEFAULT_THREE_CAMERA_PROJECTION);
 
         if (this.threeCamera && this.threeCameraState) {
             const center = this.threeOrbitCenter || new THREE.Vector3(0, 0, 0);
-            const radius = this.threeCameraState.radius;
-            const theta = this.threeCameraState.theta;
-            const phi = this.threeCameraState.phi;
-
-
-            this.threeCamera.position.x = center.x + radius * Math.sin(phi) * Math.sin(theta);
-            this.threeCamera.position.y = center.y + radius * Math.cos(phi);
-            this.threeCamera.position.z = center.z + radius * Math.sin(phi) * Math.cos(theta);
-            this.threeCamera.lookAt(center);
+            this.applyThreeCameraState(this.threeCameraState, center);
             console.log('[OpenPose] Applied camera state:', this.threeCameraState);
         }
 
@@ -4448,7 +5283,7 @@ class OpenPosePanel {
         this.render3DPose();
 
 
-        this.animate3D();
+        this.start3DAnimationLoop();
         if (!this.initial3DViewState) {
             this.recordInitial3DViewState();
         } else {
@@ -4493,6 +5328,8 @@ class OpenPosePanel {
 
 
     exit3DMode() {
+        this.stop3DAnimationLoop();
+        this.cancelPoseDescriptionRefresh();
         this.set2DCanvasInteractive(true);
         if (this.threeContainer) {
             this.threeContainer.style.display = 'none';
@@ -4526,8 +5363,9 @@ class OpenPosePanel {
 
         const width = this.threeContainer.clientWidth;
         const height = this.threeContainer.clientHeight;
-        this.threeCamera = new THREE.PerspectiveCamera(75, width / height, 0.1, 1000);
-        this.threeCamera.position.z = 500;
+        this.threeCamera = this.createThreeCameraForProjection(this.threeCameraProjectionMode) || new THREE.PerspectiveCamera(DEFAULT_THREE_CAMERA_FOV, width / height, 0.1, 10000);
+        this.threeCamera.position.z = DEFAULT_THREE_CAMERA_STATE.radius;
+        this.updateThreeCameraProjectionMatrix(this.threeCameraState?.radius ?? DEFAULT_THREE_CAMERA_STATE.radius);
 
 
         this.threeRenderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
@@ -4553,26 +5391,24 @@ class OpenPosePanel {
         this.createTransformGizmo();
 
 
-        this.animate3D();
-
-
-        setTimeout(() => this.analyzePoseAndGenerateDescription(), 100);
+        this.start3DAnimationLoop();
+        this.schedulePoseDescriptionRefresh({ immediate: true });
     }
 
 
     animate3D() {
-        if (!this.is3DMode) return;
+        if (!this.is3DMode) {
+            this.threeAnimationFrameHandle = null;
+            return;
+        }
 
 
-        requestAnimationFrame(() => this.animate3D());
+        this.threeAnimationFrameHandle = requestAnimationFrame(() => this.animate3D());
 
 
         if (this.threeRenderer && this.threeScene && this.threeCamera) {
             this.threeRenderer.render(this.threeScene, this.threeCamera);
         }
-
-
-        this.analyzePoseAndGenerateDescription();
     }
 
 
@@ -4586,19 +5422,7 @@ class OpenPosePanel {
             if (!orbitCenter) {
                 return;
             }
-
-            this.syncThreeCameraStateFromCamera();
-
-            const nextTheta = (this.threeCameraState?.theta ?? DEFAULT_THREE_CAMERA_STATE.theta) - (deltaX * THREE_CAMERA_ORBIT_SPEED);
-            const unclampedPhi = (this.threeCameraState?.phi ?? DEFAULT_THREE_CAMERA_STATE.phi) + (deltaY * THREE_CAMERA_ORBIT_SPEED);
-            const nextPhi = Math.max(THREE_CAMERA_PHI_EPSILON, Math.min(Math.PI - THREE_CAMERA_PHI_EPSILON, unclampedPhi));
-
-            this.threeCameraState = {
-                ...(this.threeCameraState || DEFAULT_THREE_CAMERA_STATE),
-                theta: nextTheta,
-                phi: nextPhi,
-            };
-            this.applyThreeCameraState(this.threeCameraState, orbitCenter);
+            this.orbitThreeCamera(deltaX, deltaY, orbitCenter);
         };
 
         const rotateModel = (deltaX, deltaY) => {
@@ -4720,6 +5544,7 @@ class OpenPosePanel {
                 }
 
                 this.syncThreeCameraStateFromCamera();
+                this.schedulePoseDescriptionRefresh();
 
                 panStartX = e.clientX;
                 panStartY = e.clientY;
@@ -4833,6 +5658,7 @@ class OpenPosePanel {
                 this.syncThreeCameraStateFromCamera();
             }
         }
+        this.schedulePoseDescriptionRefresh();
     }
 
 
@@ -5432,7 +6258,12 @@ class OpenPosePanel {
                         const currentPos = new THREE.Vector3().copy(target).sub(dragOffset);
                         const selectedPoints = this.get3DSelectedPointObjects();
 
-                        if (this.threeRigMode === "ik" && selectedPoints.length === 1 && this.solveTwoBoneIKForTarget(selectedPoints[0], currentPos)) {
+                        const ikHandled = this.threeRigMode === "ik" && selectedPoints.length === 1 && (
+                            this.solveTwoBoneIKForTarget(selectedPoints[0], currentPos) ||
+                            this.solveTwoBoneIKForMidTarget(selectedPoints[0], currentPos)
+                        );
+
+                        if (ikHandled) {
                             dragStartPos.copy(currentPos);
                         } else if (e.shiftKey && this.threeTransformCenter) {
 
@@ -5588,6 +6419,7 @@ class OpenPosePanel {
                 }
             }
         });
+        this.schedulePoseDescriptionRefresh();
     }
 
 
@@ -6224,9 +7056,11 @@ class OpenPosePanel {
 
 
     updateGizmoOrientation() {
-        if (!this.threeTransformGizmo || !this.threeModelQuaternion) return;
+        if (!this.threeTransformGizmo) return;
 
         const THREE = window.THREE;
+        const basis = this.resolveTransformBasis();
+        if (!THREE || !basis?.quaternion) return;
 
 
         if (!this._gizmoBaseQuaternions) {
@@ -6246,14 +7080,14 @@ class OpenPosePanel {
         this.threeTransformGizmo.children.forEach(child => {
             if (child.name.startsWith('axis_')) {
 
-                child.setRotationFromQuaternion(this.threeModelQuaternion);
+                child.setRotationFromQuaternion(basis.quaternion);
             } else if (child.name.startsWith('rotate_')) {
 
                 const axis = child.name.replace('rotate_', '');
                 const ring = child.children[0];
 
 
-                this._tempFinalQuaternion.copy(this.threeModelQuaternion);
+                this._tempFinalQuaternion.copy(basis.quaternion);
                 this._tempFinalQuaternion.multiply(this._gizmoBaseQuaternions[axis]);
                 ring.setRotationFromQuaternion(this._tempFinalQuaternion);
             }
@@ -6281,9 +7115,9 @@ class OpenPosePanel {
         const baseVector = this._gizmoAxisVectors[axis];
         this._tempAxisVector.copy(baseVector);
 
-
-        if (this.threeModelQuaternion) {
-            this._tempAxisVector.applyQuaternion(this.threeModelQuaternion);
+        const basis = this.resolveTransformBasis();
+        if (basis?.quaternion) {
+            this._tempAxisVector.applyQuaternion(basis.quaternion);
         }
 
         return this._tempAxisVector;
@@ -6549,7 +7383,12 @@ class OpenPosePanel {
                     ? selectedPoints[0].position.clone().add(deltaVector)
                     : null;
 
-                if (!ikTarget || !this.solveTwoBoneIKForTarget(selectedPoints[0], ikTarget)) {
+                const ikHandled = !!ikTarget && (
+                    this.solveTwoBoneIKForTarget(selectedPoints[0], ikTarget) ||
+                    this.solveTwoBoneIKForMidTarget(selectedPoints[0], ikTarget)
+                );
+
+                if (!ikHandled) {
                     if (selectedPoints.length > 0) {
                         this.translate3DSelection(deltaVector);
                     } else {

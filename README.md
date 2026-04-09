@@ -23,12 +23,13 @@ The current UI in this custom build is English, including toolbar buttons, panel
 - 2D and 3D pose editing in a single node
 - Reset View button to restore the initial camera angle and zoom
 - FK-style joint editing for controlled axis-based adjustments
-- IK support for arms and legs while preserving limb lengths
+- IK support for arms and legs while preserving limb lengths, including elbow/knee bend control
 - Built-in gizmo for X/Y/Z movement and rotation
 - Save pose JSON with a custom filename dialog
 - Load and restore saved 3D pose data, camera state, and model rotation
 - Background image loading for pose matching
 - Pose auto-completion for missing limbs and mirrored joints
+- 3D mirror tools for full-pose mirroring and left/right side copy
 - Posture text output for downstream prompt or workflow usage
 - Better coexistence with other OpenPose editors in the same ComfyUI frontend
 
@@ -66,12 +67,19 @@ If you are updating from an older local copy, a full browser hard refresh is rec
 | `Load` | Import a saved pose JSON(compatible with andreszs/ComfyUI-OpenPose-Studio's json format) |
 | `Select All` | Select all available joints |
 | `Auto Complete` | Auto-complete missing joints and limb connections |
+| `Mirror` | Mirror the active 3D pose set across the model local X axis |
+| `L→R` | Copy the left side pose to the right side in 3D |
+| `R→L` | Copy the right side pose to the left side in 3D |
 | `Background` | Load a background image |
 | `Clear Background` | Remove the background image |
 | `3D Mode: On / Off` | Toggle 2D / 3D editing mode |
 | `Gizmo: On / Off` | Toggle the 3D gizmo |
 | `Reset View` | Reset the 3D camera to the initial view |
 | `Frame` | Frame the current 3D selection, or all points if nothing is selected |
+| `Cam: World / Local` | Switch orbit and view presets between world space and model local space |
+| `Axes: Local / World` | Switch gizmo and model-rotation axes between model local space and world space |
+| `Front / Back / Left / Right / Top / Bottom` | Snap the 3D camera to a preset view around the current pivot target |
+| `Proj: Persp / Ortho` | Toggle between perspective and orthographic projection |
 | `Nav: Orbit / Model` | Switch between orbiting the camera and rotating the model |
 | `Pivot: Model / Selection` | Set the camera pivot from the model center or the current selection |
 | `Mode: FK / IK` | Switch between FK and IK editing |
@@ -85,6 +93,7 @@ If you are updating from an older local copy, a full browser hard refresh is rec
 | Right drag | Orbit the camera, or rotate the model in `Nav: Model` mode |
 | Middle drag | Pan the camera |
 | Mouse wheel | Zoom in or out |
+| View preset buttons | Reframe the camera from `Front`, `Back`, `Left`, `Right`, `Top`, or `Bottom` using the current pivot target and the active `Cam` space |
 
 ## Shortcuts
 
@@ -120,7 +129,7 @@ Use FK mode when you want to rotate or move a joint while keeping downstream joi
 
 ### IK
 
-Use IK mode when you want to drag an end effector such as a wrist or ankle while keeping limb lengths stable. The current implementation focuses on two-bone chains:
+Use IK mode when you want to drag an end effector such as a wrist or ankle while keeping limb lengths stable. You can also drag the elbow or knee directly to adjust the bend direction while preserving the two bone lengths. The current implementation focuses on two-bone chains:
 
 - Left arm
 - Right arm
@@ -135,6 +144,7 @@ Exported JSON includes:
 - 3D point data
 - 3D connection data
 - camera state
+- camera space
 - model rotation
 - orbit center
 
