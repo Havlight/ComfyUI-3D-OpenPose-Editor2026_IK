@@ -127,11 +127,16 @@ const DEFAULT_BACKGROUND_TYPE = "input";
 const DEFAULT_BACKGROUND_OPACITY = 0.6;
 const DEFAULT_THREE_SCENE_BACKGROUND = 0x000000;
 const CAMERA_ORBIT_SPEED = 0.008;
+const MODEL_TUMBLE_SPEED = 0.008;
 const CAMERA_MIN_PHI = 0.08;
 const CAMERA_MAX_PHI = Math.PI - CAMERA_MIN_PHI;
 const CAMERA_MIN_RADIUS = 60;
 const CAMERA_MAX_RADIUS = 5000;
 const CAMERA_FRAME_PADDING = 1.35;
+const CAMERA_CONTROL_MODES = {
+    orbit: "orbit",
+    model: "model",
+};
 const CAMERA_PRESETS = {
     front: { theta: 0, phi: Math.PI / 2 },
     back: { theta: Math.PI, phi: Math.PI / 2 },
@@ -165,6 +170,22 @@ const TWO_BONE_IK_CHAINS = {
     7: { root: 5, mid: 6, end: 7, name: "Right Arm" },
     10: { root: 8, mid: 9, end: 10, name: "Left Leg" },
     13: { root: 11, mid: 12, end: 13, name: "Right Leg" },
+};
+
+const MID_JOINT_CONSTRAINT_CHAINS = {
+    3: { root: 2, mid: 3, end: 4, name: "Left Arm Mid" },
+    6: { root: 5, mid: 6, end: 7, name: "Right Arm Mid" },
+    9: { root: 8, mid: 9, end: 10, name: "Left Leg Mid" },
+    12: { root: 11, mid: 12, end: 13, name: "Right Leg Mid" },
+};
+
+const LEFT_RIGHT_JOINT_SWAP_MAP = {
+    2: 5, 3: 6, 4: 7,
+    5: 2, 6: 3, 7: 4,
+    8: 11, 9: 12, 10: 13,
+    11: 8, 12: 9, 13: 10,
+    14: 15, 15: 14,
+    16: 17, 17: 16,
 };
 
 const JOINT_NAMES = {
@@ -555,10 +576,12 @@ class OpenPosePanel {
     threeModelQuaternion = null;
     initial3DViewState = null;
     threeRigMode = "fk";
+    threeCameraControlMode = CAMERA_CONTROL_MODES.orbit;
     showGizmo = true;
     showGizmoButton = null;
     resetViewButton = null;
     rigModeButton = null;
+    cameraModeButton = null;
     statusTextEl = null;
     saveFilenameDialog = null;
     poseDescriptionText = null;
@@ -1887,6 +1910,18 @@ class OpenPosePanel {
         });
         this.focusSelectionButton.title = "Center and frame the current 3D selection";
 
+        this.cameraModeButton = this.panel.addButton("Cam: Orbit", () => {
+            this.toggleThreeCameraControlMode();
+        });
+        this.cameraModeButton.title = "Switch between orbit camera and model tumble controls";
+
+        this.mirror3DButton = this.panel.addButton("Mirror", () => {
+            if (this.is3DMode) {
+                this.mirrorSelectedOrFilteredPose3D();
+            }
+        });
+        this.mirror3DButton.title = "Mirror the selected 3D pose, filtered pose, or all poses";
+
         this.rigModeButton = this.panel.addButton("Mode: FK", () => {
             this.threeRigMode = this.threeRigMode === "fk" ? "ik" : "fk";
             this.updateRigModeButton();
@@ -1965,6 +2000,7 @@ class OpenPosePanel {
         this.statusTextEl = document.createElement("div");
         this.statusTextEl.style.cssText = "min-width: 220px; color: #9ecbff; font-size: 11px; padding-left: 8px; white-space: nowrap;";
         this.mainToolbar.appendChild(this.statusTextEl);
+        this.setThreeCameraControlMode(this.node.properties.cameraControlMode, { syncNode: false });
         this.updateRigModeButton();
         this.update3DStatus();
 
@@ -2124,6 +2160,59 @@ class OpenPosePanel {
             }
         });
         return pointObjects;
+    }
+
+    get3DPoseIds() {
+        const poseIds = [...new Set((this.threePoseData?.points || []).map(point => point.poseId))];
+        poseIds.sort((a, b) => a - b);
+        return poseIds;
+    }
+
+    get3DPosePoints(poseId) {
+        return (this.threePoseData?.points || []).filter(point => point.poseId === poseId);
+    }
+
+    getFiltered3DPoseIds() {
+        const poseIds = this.get3DPoseIds();
+        const filterIndex = Number.parseInt(this.poseFilterInput?.value ?? "-1", 10);
+        if (!Number.isInteger(filterIndex) || filterIndex < 0 || filterIndex >= poseIds.length) {
+            return [];
+        }
+        return [poseIds[filterIndex]];
+    }
+
+    resolveMirrorTargetPoseIds() {
+        const selectedPoseIds = [...new Set(this.get3DSelectedPointObjects().map(obj => obj.userData.poseId))];
+        if (selectedPoseIds.length > 0) {
+            selectedPoseIds.sort((a, b) => a - b);
+            return selectedPoseIds;
+        }
+
+        const filteredPoseIds = this.getFiltered3DPoseIds();
+        if (filteredPoseIds.length > 0) {
+            return filteredPoseIds;
+        }
+
+        return this.get3DPoseIds();
+    }
+
+    getPoseCenterFromPoints(points) {
+        if (!points || points.length === 0) {
+            return null;
+        }
+
+        const total = points.reduce((acc, point) => {
+            acc.x += point.x;
+            acc.y += point.y;
+            acc.z += point.z;
+            return acc;
+        }, { x: 0, y: 0, z: 0 });
+
+        return {
+            x: total.x / points.length,
+            y: total.y / points.length,
+            z: total.z / points.length,
+        };
     }
 
     get3DBounds(sourceObjects = null) {
@@ -2303,6 +2392,88 @@ class OpenPosePanel {
         this.update3DStatus();
     }
 
+    mirrorPose3D({ poseIds = null, axis = "x", swapLeftRight = true } = {}) {
+        if (!this.threePoseData?.points?.length || !globalThis.THREE) {
+            return false;
+        }
+
+        if (axis !== "x") {
+            return false;
+        }
+
+        const THREE = globalThis.THREE;
+        const targetPoseIds = Array.isArray(poseIds) && poseIds.length > 0
+            ? [...new Set(poseIds)]
+            : this.resolveMirrorTargetPoseIds();
+
+        if (targetPoseIds.length === 0) {
+            return false;
+        }
+
+        const modelQuat = this.threeModelQuaternion ? this.threeModelQuaternion.clone() : new THREE.Quaternion();
+        const inverseModelQuat = modelQuat.clone().invert();
+        let didMirror = false;
+
+        targetPoseIds.forEach((poseId) => {
+            const posePoints = this.get3DPosePoints(poseId);
+            if (posePoints.length === 0) {
+                return;
+            }
+
+            const poseCenterPlain = this.getPoseCenterFromPoints(posePoints);
+            if (!poseCenterPlain) {
+                return;
+            }
+
+            const poseCenter = new THREE.Vector3(poseCenterPlain.x, poseCenterPlain.y, poseCenterPlain.z);
+            const mirroredByTargetId = new Map();
+
+            posePoints.forEach((point) => {
+                const localPosition = new THREE.Vector3(point.x, point.y, point.z)
+                    .sub(poseCenter)
+                    .applyQuaternion(inverseModelQuat);
+
+                localPosition.x *= -1;
+
+                const mirroredWorld = localPosition.applyQuaternion(modelQuat).add(poseCenter);
+                const targetId = swapLeftRight ? (LEFT_RIGHT_JOINT_SWAP_MAP[point.id] ?? point.id) : point.id;
+
+                mirroredByTargetId.set(targetId, {
+                    x: mirroredWorld.x,
+                    y: mirroredWorld.y,
+                    z: mirroredWorld.z,
+                });
+            });
+
+            posePoints.forEach((point) => {
+                const mirrored = mirroredByTargetId.get(point.id);
+                if (!mirrored) {
+                    return;
+                }
+
+                point.x = mirrored.x;
+                point.y = mirrored.y;
+                point.z = mirrored.z;
+                didMirror = true;
+            });
+        });
+
+        if (!didMirror) {
+            return false;
+        }
+
+        this.render3DPose();
+        this.update3DTransformCenter();
+        this.updateTransformGizmo();
+        this.update3DSelectionBox();
+        this.update3DStatus();
+        return true;
+    }
+
+    mirrorSelectedOrFilteredPose3D() {
+        return this.mirrorPose3D({ poseIds: this.resolveMirrorTargetPoseIds(), axis: "x", swapLeftRight: true });
+    }
+
     captureCurrent3DViewState() {
         this.syncThreeCameraStateFromCamera();
         return {
@@ -2384,6 +2555,96 @@ class OpenPosePanel {
         this.update3DStatus();
     }
 
+    normalizeThreeCameraControlMode(mode = this.threeCameraControlMode) {
+        return mode === CAMERA_CONTROL_MODES.model ? CAMERA_CONTROL_MODES.model : CAMERA_CONTROL_MODES.orbit;
+    }
+
+    updateCameraModeButton() {
+        if (!this.cameraModeButton) {
+            return;
+        }
+
+        const mode = this.normalizeThreeCameraControlMode();
+        const isModelMode = mode === CAMERA_CONTROL_MODES.model;
+        this.cameraModeButton.textContent = `Cam: ${isModelMode ? "Model" : "Orbit"}`;
+        this.cameraModeButton.title = isModelMode
+            ? "Right-drag tumbles the model, middle-drag pans, wheel zooms"
+            : "Right-drag orbits the camera, middle-drag pans, wheel zooms";
+    }
+
+    setThreeCameraControlMode(mode, { syncNode = true } = {}) {
+        const nextMode = this.normalizeThreeCameraControlMode(mode);
+        this.threeCameraControlMode = nextMode;
+
+        if (syncNode && this.node?.setProperty) {
+            this.node.setProperty("cameraControlMode", nextMode);
+        }
+
+        this.updateCameraModeButton();
+        this.update3DStatus();
+        return nextMode;
+    }
+
+    toggleThreeCameraControlMode() {
+        const nextMode = this.threeCameraControlMode === CAMERA_CONTROL_MODES.orbit
+            ? CAMERA_CONTROL_MODES.model
+            : CAMERA_CONTROL_MODES.orbit;
+        return this.setThreeCameraControlMode(nextMode);
+    }
+
+    rotateModelByCameraDelta(deltaX, deltaY) {
+        if (!this.threePoseData?.points?.length || !this.threeCamera || !globalThis.THREE) {
+            return false;
+        }
+
+        const THREE = globalThis.THREE;
+        const centerData = this.getModelCenter();
+        if (!centerData) {
+            return false;
+        }
+
+        const yawAngle = -deltaX * MODEL_TUMBLE_SPEED;
+        const pitchAngle = -deltaY * MODEL_TUMBLE_SPEED;
+        if (Math.abs(yawAngle) < 0.000001 && Math.abs(pitchAngle) < 0.000001) {
+            return false;
+        }
+
+        const pivot = new THREE.Vector3(centerData.x, centerData.y, centerData.z);
+        const cameraUp = new THREE.Vector3(0, 1, 0).applyQuaternion(this.threeCamera.quaternion).normalize();
+        const cameraRight = new THREE.Vector3(1, 0, 0).applyQuaternion(this.threeCamera.quaternion).normalize();
+        const yawQuat = new THREE.Quaternion().setFromAxisAngle(cameraUp, yawAngle);
+        const pitchQuat = new THREE.Quaternion().setFromAxisAngle(cameraRight, pitchAngle);
+        const deltaQuat = yawQuat.multiply(pitchQuat).normalize();
+
+        this.threePoseData.points.forEach((point) => {
+            const rotatedPosition = new THREE.Vector3(point.x, point.y, point.z)
+                .sub(pivot)
+                .applyQuaternion(deltaQuat)
+                .add(pivot);
+
+            point.x = rotatedPosition.x;
+            point.y = rotatedPosition.y;
+            point.z = rotatedPosition.z;
+
+            const pointObj = this.getThreePointObjectByIds(point.id, point.poseId);
+            if (pointObj) {
+                pointObj.position.copy(rotatedPosition);
+            }
+        });
+
+        if (!this.threeModelQuaternion) {
+            this.threeModelQuaternion = new THREE.Quaternion();
+        }
+        this.threeModelQuaternion.premultiply(deltaQuat).normalize();
+
+        this.updateAll3DLines();
+        this.update3DTransformCenter();
+        this.updateTransformGizmo();
+        this.update3DSelectionBox();
+        this.update3DStatus();
+        return true;
+    }
+
     updateRigModeButton() {
         if (this.rigModeButton) {
             this.rigModeButton.textContent = `Mode: ${this.threeRigMode.toUpperCase()}`;
@@ -2405,7 +2666,8 @@ class OpenPosePanel {
             ? (JOINT_NAMES[selectedObjects[0].userData.id] || `Joint ${selectedObjects[0].userData.id}`)
             : `${selectedObjects.length} selected`;
         const selectionText = selectedObjects.length > 0 ? selectedLabel : "No selection";
-        this.statusTextEl.textContent = `Mode: ${this.threeRigMode.toUpperCase()} | Cam: Orbit | ${selectionText}`;
+        const cameraModeLabel = this.normalizeThreeCameraControlMode() === CAMERA_CONTROL_MODES.model ? "Model" : "Orbit";
+        this.statusTextEl.textContent = `Mode: ${this.threeRigMode.toUpperCase()} | Cam: ${cameraModeLabel} | ${selectionText}`;
     }
 
     promptForPoseFilename(defaultFilename) {
@@ -2581,6 +2843,209 @@ class OpenPosePanel {
         return jointId != null ? TWO_BONE_IK_CHAINS[jointId] || null : null;
     }
 
+    findMidJointConstraintChain(obj) {
+        const jointId = obj?.userData?.id;
+        return jointId != null ? MID_JOINT_CONSTRAINT_CHAINS[jointId] || null : null;
+    }
+
+    setThreePointWorldPosition(obj, pointData, position) {
+        if (!obj || !pointData || !position) {
+            return;
+        }
+
+        obj.position.copy(position);
+        pointData.x = position.x;
+        pointData.y = position.y;
+        pointData.z = position.z;
+    }
+
+    buildStableBendPlane(rootPos, endPos, targetPosition, currentMidPos = null) {
+        const THREE = window.THREE || globalThis.THREE;
+        if (!THREE || !rootPos || !endPos) {
+            return null;
+        }
+
+        const endVector = endPos.clone().sub(rootPos);
+        if (endVector.lengthSq() < 0.000001) {
+            return null;
+        }
+
+        const candidateNormals = [];
+        const pushCandidate = (vector) => {
+            if (vector && vector.lengthSq() > 0.000001) {
+                candidateNormals.push(vector.clone().normalize());
+            }
+        };
+
+        if (targetPosition) {
+            pushCandidate(new THREE.Vector3().crossVectors(endVector, targetPosition.clone().sub(rootPos)));
+        }
+        if (currentMidPos) {
+            pushCandidate(new THREE.Vector3().crossVectors(endVector, currentMidPos.clone().sub(rootPos)));
+        }
+
+        const cameraDirection = this.threeCamera?.getWorldDirection?.(new THREE.Vector3()) || null;
+        if (cameraDirection) {
+            pushCandidate(new THREE.Vector3().crossVectors(endVector, cameraDirection));
+        }
+
+        [
+            new THREE.Vector3(0, 1, 0),
+            new THREE.Vector3(1, 0, 0),
+            new THREE.Vector3(0, 0, 1),
+        ].forEach((axis) => {
+            pushCandidate(new THREE.Vector3().crossVectors(endVector, axis));
+        });
+
+        return candidateNormals[0] || null;
+    }
+
+    projectTargetToBendSolution({
+        rootPos,
+        endPos,
+        targetPosition,
+        currentMidPos = null,
+        lengthA,
+        lengthB,
+        planeNormal = null,
+    }) {
+        const THREE = window.THREE || globalThis.THREE;
+        if (!THREE || !rootPos || !endPos || !targetPosition) {
+            return null;
+        }
+
+        const endVector = endPos.clone().sub(rootPos);
+        const distance = endVector.length();
+        if (distance < 0.000001 || lengthA < 0.001 || lengthB < 0.001) {
+            return null;
+        }
+
+        const minReach = Math.abs(lengthA - lengthB);
+        const maxReach = lengthA + lengthB;
+        if (distance < minReach - 0.001 || distance > maxReach + 0.001) {
+            return null;
+        }
+
+        const direction = endVector.clone().normalize();
+        const projectedLength = ((distance * distance) + (lengthA * lengthA) - (lengthB * lengthB)) / (2 * distance);
+        const perpendicularLength = Math.sqrt(Math.max(0, (lengthA * lengthA) - (projectedLength * projectedLength)));
+        const circleCenter = rootPos.clone().addScaledVector(direction, projectedLength);
+
+        const projectRadial = (source) => {
+            if (!source) {
+                return null;
+            }
+            const radial = source.clone().sub(circleCenter);
+            radial.addScaledVector(direction, -radial.dot(direction));
+            return radial.lengthSq() > 0.000001 ? radial : null;
+        };
+
+        let radial = projectRadial(targetPosition);
+        let usedFallback = false;
+
+        if (!radial) {
+            radial = projectRadial(currentMidPos);
+            usedFallback = true;
+        }
+
+        if (!radial && planeNormal) {
+            radial = new THREE.Vector3().crossVectors(planeNormal, direction);
+            usedFallback = true;
+        }
+
+        if (!radial || radial.lengthSq() < 0.000001) {
+            const fallbackAxis = Math.abs(direction.y) < 0.99
+                ? new THREE.Vector3(0, 1, 0)
+                : new THREE.Vector3(1, 0, 0);
+            radial = new THREE.Vector3().crossVectors(fallbackAxis, direction);
+            usedFallback = true;
+        }
+
+        if (!radial || radial.lengthSq() < 0.000001) {
+            return null;
+        }
+
+        const currentRadial = projectRadial(currentMidPos);
+        if (usedFallback && currentRadial && currentRadial.dot(radial) < 0) {
+            radial.multiplyScalar(-1);
+        }
+
+        radial.normalize();
+        return circleCenter.clone().addScaledVector(radial, perpendicularLength);
+    }
+
+    solveMidJointConstraintForTarget(obj, targetPosition) {
+        const chain = this.findMidJointConstraintChain(obj);
+        const poseId = obj?.userData?.poseId;
+        const THREE = window.THREE || globalThis.THREE;
+        if (!chain || poseId == null || !targetPosition || !THREE) {
+            return false;
+        }
+
+        const rootData = this.getThreePointDataByIds(chain.root, poseId);
+        const midData = this.getThreePointDataByIds(chain.mid, poseId);
+        const endData = this.getThreePointDataByIds(chain.end, poseId);
+        const rootObj = this.getThreePointObjectByIds(chain.root, poseId);
+        const midObj = this.getThreePointObjectByIds(chain.mid, poseId);
+        const endObj = this.getThreePointObjectByIds(chain.end, poseId);
+
+        if (!rootData || !midData || !endData || !rootObj || !midObj || !endObj) {
+            return false;
+        }
+
+        const rootPos = rootObj.position.clone();
+        const midPos = midObj.position.clone();
+        const endPos = endObj.position.clone();
+
+        const lengthA = rootPos.distanceTo(midPos);
+        const lengthB = midPos.distanceTo(endPos);
+        if (lengthA < 0.001 || lengthB < 0.001) {
+            return false;
+        }
+
+        const planeNormal = this.buildStableBendPlane(rootPos, endPos, targetPosition, midPos);
+        if (!planeNormal) {
+            return false;
+        }
+
+        const midTarget = this.projectTargetToBendSolution({
+            rootPos,
+            endPos,
+            targetPosition,
+            currentMidPos: midPos,
+            lengthA,
+            lengthB,
+            planeNormal,
+        });
+
+        if (!midTarget) {
+            return false;
+        }
+
+        this.setThreePointWorldPosition(midObj, midData, midTarget);
+        this.setThreePointWorldPosition(endObj, endData, endPos);
+
+        this.updateAll3DLines();
+        this.update3DTransformCenter();
+        this.updateTransformGizmo();
+        this.update3DSelectionBox();
+        this.update3DOrbitCenter();
+        this.update3DStatus();
+        return true;
+    }
+
+    solve3DConstraintForTarget(obj, targetPosition) {
+        if (!obj || !targetPosition) {
+            return false;
+        }
+
+        if (this.findMidJointConstraintChain(obj)) {
+            return this.solveMidJointConstraintForTarget(obj, targetPosition);
+        }
+
+        return this.solveTwoBoneIKForTarget(obj, targetPosition);
+    }
+
     solveTwoBoneIKForTarget(obj, targetPosition) {
         const chain = this.findIKChainForObject(obj);
         const poseId = obj?.userData?.poseId;
@@ -2643,15 +3108,8 @@ class OpenPosePanel {
             .addScaledVector(direction, projectedLength)
             .addScaledVector(bendDirection, perpendicularLength);
 
-        midObj.position.copy(midTarget);
-        endObj.position.copy(endTarget);
-
-        midData.x = midTarget.x;
-        midData.y = midTarget.y;
-        midData.z = midTarget.z;
-        endData.x = endTarget.x;
-        endData.y = endTarget.y;
-        endData.z = endTarget.z;
+        this.setThreePointWorldPosition(midObj, midData, midTarget);
+        this.setThreePointWorldPosition(endObj, endData, endTarget);
 
         this.updateAll3DLines();
         this.update3DTransformCenter();
@@ -4612,7 +5070,8 @@ class OpenPosePanel {
 
 
     setup3DOrbitControls() {
-        let isRotating = false;
+        let isOrbitRotating = false;
+        let isModelRotating = false;
         let mouseX = 0;
         let mouseY = 0;
 
@@ -4620,7 +5079,9 @@ class OpenPosePanel {
 
         cameraElement.addEventListener('mousedown', (e) => {
             if (e.button === 2) {
-                isRotating = true;
+                const controlMode = this.normalizeThreeCameraControlMode();
+                isOrbitRotating = controlMode === CAMERA_CONTROL_MODES.orbit;
+                isModelRotating = controlMode === CAMERA_CONTROL_MODES.model;
                 mouseX = e.clientX;
                 mouseY = e.clientY;
                 e.preventDefault();
@@ -4642,11 +5103,15 @@ class OpenPosePanel {
 
 
         const handlePointerMove = (e) => {
-            if (isRotating) {
+            if (isOrbitRotating || isModelRotating) {
                 const deltaX = e.clientX - mouseX;
                 const deltaY = e.clientY - mouseY;
 
-                this.orbitCameraByDelta(deltaX, deltaY);
+                if (isOrbitRotating) {
+                    this.orbitCameraByDelta(deltaX, deltaY);
+                } else if (isModelRotating) {
+                    this.rotateModelByCameraDelta(deltaX, deltaY);
+                }
 
                 mouseX = e.clientX;
                 mouseY = e.clientY;
@@ -4665,7 +5130,8 @@ class OpenPosePanel {
 
         const handlePointerUp = (e) => {
             if (e.button === 2) {
-                isRotating = false;
+                isOrbitRotating = false;
+                isModelRotating = false;
             } else if (e.button === 1) {
                 isPanning = false;
             }
@@ -5353,7 +5819,7 @@ class OpenPosePanel {
                         const currentPos = new THREE.Vector3().copy(target).sub(dragOffset);
                         const selectedPoints = this.get3DSelectedPointObjects();
 
-                        if (this.threeRigMode === "ik" && selectedPoints.length === 1 && this.solveTwoBoneIKForTarget(selectedPoints[0], currentPos)) {
+                        if (this.threeRigMode === "ik" && selectedPoints.length === 1 && this.solve3DConstraintForTarget(selectedPoints[0], currentPos)) {
                             dragStartPos.copy(currentPos);
                         } else if (e.shiftKey && this.threeTransformCenter) {
 
@@ -6464,7 +6930,7 @@ class OpenPosePanel {
                     ? selectedPoints[0].position.clone().add(deltaVector)
                     : null;
 
-                if (!ikTarget || !this.solveTwoBoneIKForTarget(selectedPoints[0], ikTarget)) {
+                if (!ikTarget || !this.solve3DConstraintForTarget(selectedPoints[0], ikTarget)) {
                     if (selectedPoints.length > 0) {
                         this.translate3DSelection(deltaVector);
                     } else {
